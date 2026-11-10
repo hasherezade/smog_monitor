@@ -13,6 +13,7 @@ Ubuntu desktop install). Everything else is stdlib.
 Layout of this file:
   1. config          - constants you may want to change
   2. GIOŚ client     - pure functions, no GUI imports (unit-testable)
+  2b. Airly client   - optional second source, needs a personal API key
   3. map tiles       - Web Mercator maths + on-disk tile cache
   4. renderer        - draws onto any cairo context (also used by --snapshot)
   5. GTK shell       - window, input, refresh timer
@@ -71,7 +72,22 @@ TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 USER_AGENT = "warsaw-smog-widget/0.1 (personal desktop widget)"
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "warsaw-smog"
-STATE_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "warsaw-smog.json"
+_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+STATE_FILE = _CONFIG / "warsaw-smog.json"
+
+# Airly (optional). The city's own sensor network - about 108 units in the
+# districts, mostly at schools - is Airly hardware and is only reachable through
+# Airly's API, which needs a personal key and allows 100 requests per day on the
+# free plan. One request returns one sensor, so readings are fetched only for
+# the district you are looking at, capped and cached to stay inside that budget:
+#   steady state = AIRLY_MAX_PER_VIEW * 24h / AIRLY_MAX_AGE  (8 * 24/3 = 64 / day)
+# which leaves ~30 requests a day for switching districts.
+AIRLY_API = "https://airapi.airly.eu/v2"
+AIRLY_KEY_FILE = _CONFIG / "warsaw-smog-airly.key"   # or env AIRLY_API_KEY
+AIRLY_DAILY_BUDGET = 95           # stop a little short of the hard limit of 100
+AIRLY_MAX_PER_VIEW = 8            # sensors fetched per district (nearest to its centre)
+AIRLY_MAX_AGE = 3 * 3600          # reuse a reading for this long before refetching
+AIRLY_RADIUS_KM = 20              # installation list radius around MAP_CENTER
 
 # Polish air quality index, 0 (best) .. 5 (worst). Colours follow the GIOŚ portal.
 INDEX = [
@@ -83,6 +99,9 @@ INDEX = [
     ("Very bad",   (0.60, 0.00, 0.00)),
 ]
 NO_INDEX = ("No index", (0.55, 0.58, 0.62))
+# Upper bounds (µg/m³, 1 h) of categories 0..4 in the Polish index; above the
+# last one is category 5. Used to put Airly readings on the same colour scale.
+PL_INDEX_LIMITS = {"pm10": (20, 50, 80, 110, 150), "pm25": (13, 35, 55, 75, 110)}
 
 
 # ----------------------------------------------------------------------------
@@ -130,6 +149,11 @@ class Station:
     index_time: str = ""                          # "YYYY-MM-DD HH:MM:SS", local time
     pm10: float | None = None
     pm25: float | None = None
+    source: str = "GIOŚ"                          # or "Airly"
+
+    @property
+    def uid(self) -> str:                         # ids are only unique per source
+        return f"{self.source}:{self.id}"
 
 
 def parse_stations(rows: list, city: str) -> list[Station]:
@@ -252,6 +276,192 @@ def fetch_readings(stations: list[Station]) -> None:
                     break
 
 
+# ----------------------------------------------------------------------------
+# 2b. Airly client (optional second source)
+# ----------------------------------------------------------------------------
+def pl_index(pm10: float | None, pm25: float | None) -> int | None:
+    """Polish index category from PM values: the worse of the two pollutants."""
+    cats = []
+    for key, v in (("pm10", pm10), ("pm25", pm25)):
+        if v is not None:
+            cats.append(sum(v > limit for limit in PL_INDEX_LIMITS[key]))
+    return max(cats) if cats else None
+
+
+def parse_airly_installations(rows: list) -> list[dict]:
+    out = []
+    for r in rows:
+        if r.get("airly") is False:
+            continue        # third-party stations mirrored by Airly, e.g. GIOŚ itself
+        try:
+            a = r.get("address") or {}
+            name = " ".join(x for x in (a.get("street"), a.get("number")) if x) \
+                or a.get("displayAddress2") or a.get("displayAddress1") or f"Airly {r['id']}"
+            out.append({"id": int(r["id"]), "name": str(name),
+                        "lat": float(r["location"]["latitude"]),
+                        "lon": float(r["location"]["longitude"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def parse_airly_measurement(doc: dict, inst: dict) -> Station:
+    cur = doc.get("current") or {}
+    vals = {v.get("name"): v.get("value") for v in cur.get("values") or []}
+    pm10, pm25 = vals.get("PM10"), vals.get("PM25")
+    when = ""
+    try:
+        from datetime import datetime
+        when = datetime.fromisoformat(cur["tillDateTime"].replace("Z", "+00:00")) \
+            .astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (KeyError, AttributeError, ValueError):
+        pass
+    return Station(inst["id"], inst["name"], inst["lat"], inst["lon"],
+                   index=pl_index(pm10, pm25), index_time=when if vals else "",
+                   pm10=pm10, pm25=pm25, source="Airly")
+
+
+def airly_key() -> str:
+    key = os.environ.get("AIRLY_API_KEY", "").strip()
+    if not key:
+        try:
+            key = AIRLY_KEY_FILE.read_text().strip()
+        except OSError:
+            pass
+    return key
+
+
+def in_view(lat: float, lon: float, district: str, w: float, h: float) -> bool:
+    clat, clon, z = viewport(district)
+    cx, cy = mercator_px(clat, clon, z)
+    px, py = mercator_px(lat, lon, z)
+    return abs(px - cx) <= w / 2 and abs(py - cy) <= h / 2
+
+
+class Airly:
+    """Airly API client that keeps itself inside the daily request budget."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self.lock = threading.Lock()
+        self.readings: dict[int, tuple[float, Station]] = {}   # memory only, never on disk
+        self.budget_file = CACHE_DIR / "airly_budget.json"
+
+    def _budget(self) -> dict:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        try:
+            b = json.loads(self.budget_file.read_text())
+            if b.get("day") == today:
+                return b
+        except (OSError, ValueError):
+            pass
+        return {"day": today, "used": 0, "remaining": None}
+
+    def left(self) -> int:
+        b = self._budget()
+        n = AIRLY_DAILY_BUDGET - b["used"]
+        return max(0, n if b["remaining"] is None else min(n, b["remaining"]))
+
+    def _get(self, path: str):
+        if self.left() <= 0:
+            raise RateLimited(path)
+        b = self._budget()
+        b["used"] += 1
+        req = urllib.request.Request(AIRLY_API + path, headers={
+            "apikey": self.key, "Accept": "application/json",
+            "Accept-Language": "en", "User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                rem = resp.headers.get("X-RateLimit-Remaining-day")
+                if rem is not None and rem.isdigit():
+                    b["remaining"] = int(rem)
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                b["remaining"] = 0
+                raise RateLimited(path) from e
+            raise
+        finally:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self.budget_file.write_text(json.dumps(b))
+
+    def installations(self) -> list[dict]:
+        path = CACHE_DIR / "airly_installations.json"
+        try:
+            c = json.loads(path.read_text())
+            if time.time() - c["ts"] < METADATA_TTL:
+                return c["items"]
+        except (OSError, ValueError, KeyError):
+            pass
+        items = parse_airly_installations(self._get(
+            f"/installations/nearest?lat={MAP_CENTER[0]}&lng={MAP_CENTER[1]}"
+            f"&maxDistanceKM={AIRLY_RADIUS_KM}&maxResults=-1"))
+        path.write_text(json.dumps({"ts": time.time(), "items": items}, ensure_ascii=False))
+        return items
+
+    def update(self, district: str) -> tuple[list[Station], str]:
+        """Sensors for one district view, plus a one-line status for the map."""
+        with self.lock:
+            _, _, mw, mh = map_rect()
+            clat, clon, _ = viewport(district)
+            picked = sorted(
+                (i for i in self.installations() if in_view(i["lat"], i["lon"], district, mw, mh)),
+                key=lambda i: distance_km(clat, clon, i["lat"], i["lon"]))[:AIRLY_MAX_PER_VIEW]
+            out, limited = [], False
+            for inst in picked:
+                ts, st = self.readings.get(inst["id"], (0.0, None))
+                if time.time() - ts > AIRLY_MAX_AGE and not limited:
+                    try:
+                        st = parse_airly_measurement(self._get(
+                            f"/measurements/installation?installationId={inst['id']}"), inst)
+                        self.readings[inst["id"]] = (time.time(), st)
+                    except RateLimited:
+                        limited = True
+                    except urllib.error.HTTPError as e:
+                        if e.code in (401, 403):
+                            raise
+                    except Exception:
+                        pass
+                # no fresh reading: show a stale one (max a day old) or a grey marker
+                if st is None or time.time() - self.readings.get(inst["id"], (0.0,))[0] > 86400:
+                    st = Station(inst["id"], inst["name"], inst["lat"], inst["lon"], source="Airly")
+                out.append(st)
+            if limited:
+                return out, "Airly: daily request limit reached"
+            if not picked:
+                return out, "Airly: no sensors in this view"
+            return out, f"Airly: {len(out)} sensor{'s' * (len(out) != 1)} · {self.left()} requests left today"
+
+
+def airly_view(client: Airly | None, district: str, demo: bool) -> tuple[list[Station], str]:
+    """What to show for Airly in the given view. Never raises."""
+    if not district:
+        return [], ""           # city view stays GIOŚ-only: 100+ dots, and no budget for them
+    if demo:
+        return demo_airly(district), "Airly: demo sensors"
+    if client is None:
+        return [], "Airly key not set: city sensors hidden (see README)"
+    try:
+        return client.update(district)
+    except RateLimited:
+        return [], "Airly: daily request limit reached"
+    except urllib.error.HTTPError as e:
+        return [], "Airly: key rejected" if e.code in (401, 403) else f"Airly: HTTP {e.code}"
+    except Exception as e:
+        return [], f"Airly unavailable ({type(e).__name__})"
+
+
+def demo_airly(district: str) -> list[Station]:
+    """Fake sensors scattered round a district centre. Not real locations."""
+    clat, clon, _ = viewport(district)
+    pts = [(0.012, -0.020, 30, 19), (-0.008, 0.015, 62, 41), (0.004, 0.028, 18, 9),
+           (-0.016, -0.012, 95, 60), (0.019, 0.006, None, None)]
+    return [Station(i, f"demo sensor {i + 1}", clat + dy, clon + dx, index=pl_index(p10, p25),
+                    index_time="2026-11-10 14:00:00" if p10 else "", pm10=p10, pm25=p25,
+                    source="Airly")
+            for i, (dy, dx, p10, p25) in enumerate(pts)]
+
+
 def demo_stations() -> list[Station]:
     """Plausible fake data for --demo / layout work. Not real measurements."""
     rows = [
@@ -334,7 +544,9 @@ class View:
     updated: float = 0.0
     error: str = ""
     loading: bool = True
-    hover: int | None = None          # station id under the pointer
+    hover: str | None = None          # Station.uid under the pointer
+    airly: list[Station] = field(default_factory=list)   # sensors for the current district
+    airly_status: str = ""
     demo: bool = False
     district: str = ""                # "" = whole city, else a key of DISTRICTS
     hits: list = field(default_factory=list)   # [(x, y, station)] from last draw
@@ -447,31 +659,50 @@ def render(ctx, view: View) -> None:
         ctx.set_source_surface(surf, round(ox + tx * 256), round(oy + ty * 256))
         ctx.paint_with_alpha(0.55)                    # dim the basemap so dots carry
     view.hits = []
-    # draw worst last so it stays on top where stations overlap
-    for s in sorted(view.stations, key=lambda s: -1 if s.index is None else s.index):
+    visible = view.stations + (view.airly if view.district else [])
+    # GIOŚ reference stations on top of Airly sensors; within each, worst last
+    for s in sorted(visible, key=lambda s: (s.source == "GIOŚ", -1 if s.index is None else s.index)):
         px, py = mercator_px(s.lat, s.lon, zoom)
         x, y = ox + px, oy + py
         if not (mx <= x <= mx + mw and my <= y <= my + mh):
             continue
         view.hits.append((x, y, s))
-        hovered = s.id == view.hover
-        ctx.arc(x, y, 9.5 if hovered else 7.5, 0, 2 * math.pi)
+        hovered = s.uid == view.hover
+        if s.source == "GIOŚ":
+            ctx.arc(x, y, 9.5 if hovered else 7.5, 0, 2 * math.pi)
+        else:                                   # diamond = low-cost sensor
+            r = 9.0 if hovered else 7.0
+            ctx.move_to(x, y - r)
+            ctx.line_to(x + r, y)
+            ctx.line_to(x, y + r)
+            ctx.line_to(x - r, y)
+            ctx.close_path()
         ctx.set_source_rgb(*(INDEX[s.index][1] if s.index is not None else NO_INDEX[1]))
         ctx.fill_preserve()
         ctx.set_line_width(2.2 if hovered else 1.4)
         ctx.set_source_rgba(1, 1, 1, 0.95 if hovered else 0.75)
         ctx.stroke()
+    if view.district and view.airly_status:
+        ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        ctx.set_font_size(9)
+        tw = min(ctx.text_extents(view.airly_status).x_advance, mw - 28)
+        _rounded(ctx, mx + 6, my + mh - 24, tw + 12, 18, 6)
+        ctx.set_source_rgba(0.07, 0.09, 0.11, 0.80)
+        ctx.fill()
+        _text(ctx, view.airly_status, mx + 12, my + mh - 11.5, 9, (0.80, 0.83, 0.87), maxw=mw - 28)
     ctx.restore()
 
     # detail line: hovered station; else in a district view the station nearest
     # its centre (most districts have none of their own); else the city mean
     y0 = my + mh + 20
-    sel = next((s for s in view.stations if s.id == view.hover), None)
+    sel = next((s for s in visible if s.uid == view.hover), None)
     note = ""
-    if sel is None and view.district and view.stations:
-        sel = min(ranked or view.stations,      # prefer one that is actually reporting
+    if sel is not None:
+        note = sel.source + (f" · {sel.index_time[11:16]}" if sel.index_time else "")
+    elif view.district and visible:
+        sel = min([s for s in visible if s.index is not None] or visible,   # prefer a reporting one
                   key=lambda s: distance_km(clat, clon, s.lat, s.lon))
-        note = f"nearest · {distance_km(clat, clon, sel.lat, sel.lon):.1f} km from centre"
+        note = f"nearest ({sel.source}) · {distance_km(clat, clon, sel.lat, sel.lon):.1f} km from centre"
     if sel:
         name = sel.name.split(",", 1)[-1].strip() or sel.name
         lab, col = INDEX[sel.index] if sel.index is not None else NO_INDEX
@@ -496,6 +727,11 @@ def render(ctx, view: View) -> None:
         ctx.fill()
     _text(ctx, "very good", 14, ly + 16, 9, dim)
     _text(ctx, "very bad", W - 14, ly + 16, 9, dim, right=True)
+    shown_airly = bool(view.district and view.airly)
+    if shown_airly:
+        ctx.set_font_size(9)
+        key_text = "circle: GIOŚ · diamond: Airly"
+        _text(ctx, key_text, (W - ctx.text_extents(key_text).x_advance) / 2, ly + 16, 9, dim)
 
     # footer: status + attribution (required by both GIOŚ and OSM terms)
     if view.error:
@@ -507,7 +743,8 @@ def render(ctx, view: View) -> None:
     else:
         status, col = "", dim
     _text(ctx, status, 14, H - 10, 9, col, maxw=W / 2 - 14)
-    _text(ctx, "Data: GIOŚ · Map © OpenStreetMap", W - 14, H - 10, 9, dim, right=True)
+    _text(ctx, f"Data: GIOŚ{', Airly' if shown_airly else ''} · Map © OpenStreetMap",
+          W - 14, H - 10, 9, dim, right=True)
 
 
 def load_tile_surfaces(view: View) -> None:
@@ -539,6 +776,8 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     if district is None:
         district = saved.get("district", "")
     view = View(demo=demo, district=district if district in DISTRICTS else "")
+    key = airly_key()
+    airly = Airly(key) if key else None
     win = Gtk.Window(title="Warsaw smog")
     win.set_default_size(WIDTH, HEIGHT)
     win.set_resizable(False)
@@ -561,10 +800,10 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
 
     def refresh():
         def work():
-            err, stations = "", None
+            err, stations, d = "", None, view.district
             try:
                 _, _, mw, mh = map_rect()
-                ensure_tiles(mw, mh, view.district)
+                ensure_tiles(mw, mh, d)
                 if demo:
                     stations = demo_stations()
                 else:
@@ -574,12 +813,15 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
                 err = "GIOŚ rate limit hit, retrying later"
             except Exception as e:
                 err = f"{type(e).__name__}: {getattr(e, 'reason', e)}"
+            air = airly_view(airly, d, demo)       # independent of GIOŚ succeeding
 
             def apply():
                 view.loading = False
                 view.error = err
                 if stations is not None and not err:
                     view.stations, view.updated = stations, time.time()
+                if view.district == d:              # user may have switched meanwhile
+                    view.airly, view.airly_status = air
                 load_tile_surfaces(view)
                 area.queue_draw()
             GLib.idle_add(apply)
@@ -589,7 +831,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
 
     def on_motion(_w, ev):
         hit = min(view.hits, key=lambda h: (h[0] - ev.x) ** 2 + (h[1] - ev.y) ** 2, default=None)
-        hid = hit[2].id if hit and (hit[0] - ev.x) ** 2 + (hit[1] - ev.y) ** 2 <= 14 ** 2 else None
+        hid = hit[2].uid if hit and (hit[0] - ev.x) ** 2 + (hit[1] - ev.y) ** 2 <= 14 ** 2 else None
         chip = in_chip(ev)
         if hid != view.hover or chip != view.chip_hover:
             view.hover, view.chip_hover = hid, chip
@@ -604,6 +846,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         if name == view.district:
             return
         view.district, view.hover = name, None
+        view.airly, view.airly_status = [], ("Airly: loading…" if name and airly else "")
         save_state()
         load_tile_surfaces(view)        # whatever is cached shows immediately
         area.queue_draw()
@@ -612,6 +855,13 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             _, _, mw, mh = map_rect()
             ensure_tiles(mw, mh, name)
             GLib.idle_add(lambda: (load_tile_surfaces(view), area.queue_draw()) and False)
+            air = airly_view(airly, name, demo)
+
+            def apply():
+                if view.district == name:
+                    view.airly, view.airly_status = air
+                    area.queue_draw()
+            GLib.idle_add(apply)
         threading.Thread(target=work, daemon=True).start()
 
     def in_chip(ev):
@@ -649,7 +899,10 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             pick = Gtk.MenuItem(label="District")
             pick.set_submenu(sub)
             menu.append(pick)
-            for text, cb in (("Refresh now", lambda *_: refresh()), ("Quit", quit_app)):
+            for text, cb in (("Refresh now", lambda *_: refresh()),
+                             ("Open Airly map", lambda *_: Gtk.show_uri_on_window(
+                                 win, "https://airly.org/map/en/", Gdk.CURRENT_TIME)),
+                             ("Quit", quit_app)):
                 item = Gtk.MenuItem(label=text)
                 item.connect("activate", cb)
                 menu.append(item)
@@ -699,6 +952,8 @@ def snapshot(path: str, demo: bool, district: str | None = None) -> None:
         view.stations = load_metadata(CITY)
         fetch_readings(view.stations)
     view.updated = time.time()
+    key = airly_key()
+    view.airly, view.airly_status = airly_view(Airly(key) if key else None, view.district, demo)
     load_tile_surfaces(view)
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH * 2, HEIGHT * 2)
     ctx = cairo.Context(surf)
