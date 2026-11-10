@@ -15,7 +15,7 @@ sensors, coloured by the Polish air quality index.
 - Minimum, average and maximum readings for the current session, with a trend line.
 - History saved to CSV files for later comparison.
 
-## Install and run
+## Try it
 
     sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0   # usually already present
     python3 warsaw_smog.py
@@ -79,15 +79,19 @@ Good to know:
   district averages.
 - Made-up readings from `--demo` are never saved.
 
-## Start at login
+## Install and start at login
 
-Save this as `~/.config/autostart/warsaw-smog.desktop`, with the real path:
+To install the widget for your user and have it start whenever you log in:
 
-    [Desktop Entry]
-    Type=Application
-    Name=Warsaw smog
-    Exec=python3 /path/to/warsaw_smog.py
-    X-GNOME-Autostart-enabled=true
+    ./install.sh
+
+This copies the widget to `~/.local/share/warsaw-smog/app/`, adds "Warsaw smog"
+to the applications menu and adds an autostart entry. It needs no administrator
+rights. Run it again after downloading a newer version to update.
+
+To remove it again (your settings and history are kept):
+
+    ./install.sh --uninstall
 
 ## Data sources
 
