@@ -39,7 +39,7 @@ from pathlib import Path
 CITY = "Warszawa"                 # matched against "Nazwa miasta"
 MAP_CENTER = (52.232, 21.045)     # lat, lon
 MAP_ZOOM = 10                     # z10 fits the whole city in ~320 px
-WIDTH, HEIGHT = 360, 496
+WIDTH, HEIGHT = 360, 518
 
 # District views: approximate centre (lat, lon) and zoom. These are hand-placed
 # centre points, not official boundaries - adjust to taste. z12 shows roughly
@@ -733,7 +733,7 @@ class View:
 
 
 def map_rect() -> tuple[float, float, float, float]:
-    return 12.0, 62.0, WIDTH - 24.0, HEIGHT - 62.0 - 112.0
+    return 12.0, 62.0, WIDTH - 24.0, HEIGHT - 62.0 - 134.0
 
 
 def _rounded(ctx, x, y, w, h, r):
@@ -939,21 +939,19 @@ def render(ctx, view: View) -> None:
                 t = t[:-2].rstrip() + "…"
             if t:
                 items.append((x, y, ctx.text_extents(t).x_advance + 6, t))
-        fixed = [(mx + 6, my + 6, 62, 18)]                      # the checkbox
-        if view.district and (view.airly_status or view.community_status):
-            fixed.append((mx + 6, my + mh - 24, mw * 0.62, 18))  # the status line
         for (x, y, w, t), box in zip(items, place_labels(
-                [(x, y, w) for x, y, w, _ in items], (mx, my, mw, mh), fixed)):
+                [(x, y, w) for x, y, w, _ in items], (mx, my, mw, mh))):
             _rounded(ctx, *box, 4)
             ctx.set_source_rgba(0.07, 0.09, 0.11, 0.78)
             ctx.fill()
             _text(ctx, t, box[0] + 3, box[1] + 10, 8.5, (0.88, 0.90, 0.93))
-    # the checkbox itself, top-left corner of the map
-    view.toggle = (mx + 6, my + 6, 62, 18)
-    _rounded(ctx, *view.toggle, 6)
-    ctx.set_source_rgba(0.07, 0.09, 0.11, 0.80)
-    ctx.fill()
-    bx, by = mx + 12, my + 10
+    ctx.restore()
+
+    # control row under the map (nothing is drawn over the map itself):
+    # the "labels" checkbox on the left, source status on the right
+    ry = my + mh + 6
+    view.toggle = (10, ry - 1, 56, 18)                # click target, a little generous
+    bx, by = 14, ry + 3
     ctx.rectangle(bx + 0.5, by + 0.5, 9, 9)
     ctx.set_line_width(1)
     ctx.set_source_rgba(1, 1, 1, 0.75)
@@ -968,18 +966,15 @@ def render(ctx, view: View) -> None:
     _text(ctx, "labels", bx + 15, by + 8.5, 9, (0.80, 0.83, 0.87))
     extra = " · ".join(t for t in (view.airly_status, view.community_status, view.street_status) if t)
     if view.district and extra:
-        ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         ctx.set_font_size(9)
-        tw = min(ctx.text_extents(extra).x_advance, mw - 28)
-        _rounded(ctx, mx + 6, my + mh - 24, tw + 12, 18, 6)
-        ctx.set_source_rgba(0.07, 0.09, 0.11, 0.80)
-        ctx.fill()
-        _text(ctx, extra, mx + 12, my + mh - 11.5, 9, (0.80, 0.83, 0.87), maxw=mw - 28)
-    ctx.restore()
+        avail = W - 14 - 74                           # right of the checkbox
+        while len(extra) > 4 and ctx.text_extents(extra).x_advance > avail:
+            extra = extra[:-2].rstrip() + "…"
+        _text(ctx, extra, W - 14, by + 8.5, 9, dim, right=True)
 
     # detail line: hovered station; else in a district view the station nearest
     # its centre (most districts have none of their own); else the city mean
-    y0 = my + mh + 20
+    y0 = my + mh + 42
     sel = next((s for s in visible if s.uid == view.hover), None)
     note = ""
     if sel is not None:
