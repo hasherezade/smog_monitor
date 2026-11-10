@@ -38,6 +38,30 @@ CITY = "Warszawa"                 # matched against "Nazwa miasta"
 MAP_CENTER = (52.232, 21.045)     # lat, lon
 MAP_ZOOM = 10                     # z10 fits the whole city in ~320 px
 WIDTH, HEIGHT = 360, 482
+
+# District views: approximate centre (lat, lon) and zoom. These are hand-placed
+# centre points, not official boundaries - adjust to taste. z12 shows roughly
+# 8 x 7.5 km; the two largest districts use z11.
+DISTRICTS = {
+    "Bemowo":         (52.239, 20.913, 12),
+    "Białołęka":      (52.320, 20.990, 11),
+    "Bielany":        (52.285, 20.935, 12),
+    "Mokotów":        (52.193, 21.035, 12),
+    "Ochota":         (52.212, 20.972, 12),
+    "Praga-Południe": (52.239, 21.085, 12),
+    "Praga-Północ":   (52.262, 21.035, 12),
+    "Rembertów":      (52.260, 21.165, 12),
+    "Śródmieście":    (52.232, 21.015, 12),
+    "Targówek":       (52.285, 21.060, 12),
+    "Ursus":          (52.195, 20.885, 12),
+    "Ursynów":        (52.140, 21.040, 12),
+    "Wawer":          (52.200, 21.170, 11),
+    "Wesoła":         (52.240, 21.225, 12),
+    "Wilanów":        (52.155, 21.105, 12),
+    "Włochy":         (52.185, 20.945, 12),
+    "Wola":           (52.237, 20.960, 12),
+    "Żoliborz":       (52.270, 20.985, 12),
+}
 REFRESH_MINUTES = 30              # GIOŚ publishes hourly values
 METADATA_TTL = 7 * 24 * 3600      # station / sensor lists rarely change
 
@@ -254,25 +278,43 @@ def mercator_px(lat: float, lon: float, zoom: int) -> tuple[float, float]:
     return x, y
 
 
-def tiles_for_view(w: float, h: float) -> list[tuple[int, int]]:
-    cx, cy = mercator_px(*MAP_CENTER, MAP_ZOOM)
+_PL = "aąbcćdeęfghijklłmnńoóprsśtuwyzźż"
+PL_SORT_KEY = lambda name: [_PL.find(c) for c in name.lower()]
+
+
+def viewport(district: str) -> tuple[float, float, int]:
+    """(lat, lon, zoom) for a district name, or the whole city for ""."""
+    return DISTRICTS.get(district) or (*MAP_CENTER, MAP_ZOOM)
+
+
+def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Equirectangular approximation; error is negligible at city scale."""
+    dx = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
+    dy = math.radians(lat2 - lat1)
+    return 6371.0 * math.hypot(dx, dy)
+
+
+def tiles_for_view(w: float, h: float, district: str = "") -> list[tuple[int, int, int]]:
+    """(z, x, y) of every tile intersecting a w x h px view of the district."""
+    lat, lon, z = viewport(district)
+    cx, cy = mercator_px(lat, lon, z)
     x0, x1 = int((cx - w / 2) // 256), int((cx + w / 2) // 256)
     y0, y1 = int((cy - h / 2) // 256), int((cy + h / 2) // 256)
-    return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    return [(z, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 
-def tile_path(x: int, y: int) -> Path:
-    return CACHE_DIR / "tiles" / str(MAP_ZOOM) / str(x) / f"{y}.png"
+def tile_path(z: int, x: int, y: int) -> Path:
+    return CACHE_DIR / "tiles" / str(z) / str(x) / f"{y}.png"
 
 
-def ensure_tiles(w: float, h: float) -> None:
+def ensure_tiles(w: float, h: float, district: str = "") -> None:
     """Download missing tiles once; they are kept on disk indefinitely."""
-    for x, y in tiles_for_view(w, h):
-        p = tile_path(x, y)
+    for z, x, y in tiles_for_view(w, h, district):
+        p = tile_path(z, x, y)
         if p.exists():
             continue
         try:
-            data = http_get(TILE_URL.format(z=MAP_ZOOM, x=x, y=y))
+            data = http_get(TILE_URL.format(z=z, x=x, y=y))
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 continue
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -294,8 +336,11 @@ class View:
     loading: bool = True
     hover: int | None = None          # station id under the pointer
     demo: bool = False
+    district: str = ""                # "" = whole city, else a key of DISTRICTS
     hits: list = field(default_factory=list)   # [(x, y, station)] from last draw
-    tiles: dict = field(default_factory=dict)  # {(x, y): cairo surface}
+    chip: tuple = (0.0, 0.0, 0.0, 0.0)         # district selector rect from last draw
+    chip_hover: bool = False
+    tiles: dict = field(default_factory=dict)  # {(z, x, y): cairo surface}
 
 
 def map_rect() -> tuple[float, float, float, float]:
@@ -356,9 +401,30 @@ def render(ctx, view: View) -> None:
     ctx.arc(26, 31, 9, 0, 2 * math.pi)
     ctx.set_source_rgb(*colour)
     ctx.fill()
-    _text(ctx, "Warsaw air" + ("  (demo data)" if view.demo else ""), 44, 27, 13, bold=True)
-    if worst:
-        sub = f"Worst: {label} · {len(ranked)}/{len(view.stations)} stations reporting"
+    # district selector: a clickable "chip" at the top right (left-click opens the list)
+    chip_label = view.district or "Whole city"
+    ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+    ctx.set_font_size(11)
+    cw = ctx.text_extents(chip_label).x_advance + 36
+    view.chip = (W - 14 - cw, 12, cw, 24)
+    _rounded(ctx, *view.chip, 12)
+    ctx.set_source_rgba(1, 1, 1, 0.20 if view.chip_hover else 0.10)
+    ctx.fill_preserve()
+    ctx.set_line_width(1)
+    ctx.set_source_rgba(1, 1, 1, 0.35)
+    ctx.stroke()
+    _text(ctx, chip_label, view.chip[0] + 10, 28, 11)
+    ax = W - 14 - 18                                  # arrow drawn, not a font glyph
+    ctx.move_to(ax - 4, 22)
+    ctx.line_to(ax + 4, 22)
+    ctx.line_to(ax, 27)
+    ctx.close_path()
+    ctx.set_source_rgb(0.92, 0.94, 0.96)
+    ctx.fill()
+    _text(ctx, "Warsaw air" + (" (demo)" if view.demo else ""), 44, 27, 13, bold=True,
+          maxw=view.chip[0] - 52)
+    if worst:   # always the city-wide verdict, also in a district view
+        sub = f"City worst: {label} · {len(ranked)}/{len(view.stations)} stations reporting"
     elif view.loading:
         sub = "Loading…"
     else:
@@ -372,15 +438,18 @@ def render(ctx, view: View) -> None:
     ctx.clip()
     ctx.set_source_rgb(0.12, 0.15, 0.18)
     ctx.paint()
-    cx, cy = mercator_px(*MAP_CENTER, MAP_ZOOM)
+    clat, clon, zoom = viewport(view.district)
+    cx, cy = mercator_px(clat, clon, zoom)
     ox, oy = mx + mw / 2 - cx, my + mh / 2 - cy       # global px -> widget px
-    for (tx, ty), surf in view.tiles.items():
+    for (tz, tx, ty), surf in view.tiles.items():
+        if tz != zoom:
+            continue
         ctx.set_source_surface(surf, round(ox + tx * 256), round(oy + ty * 256))
         ctx.paint_with_alpha(0.55)                    # dim the basemap so dots carry
     view.hits = []
     # draw worst last so it stays on top where stations overlap
     for s in sorted(view.stations, key=lambda s: -1 if s.index is None else s.index):
-        px, py = mercator_px(s.lat, s.lon, MAP_ZOOM)
+        px, py = mercator_px(s.lat, s.lon, zoom)
         x, y = ox + px, oy + py
         if not (mx <= x <= mx + mw and my <= y <= my + mh):
             continue
@@ -394,13 +463,23 @@ def render(ctx, view: View) -> None:
         ctx.stroke()
     ctx.restore()
 
-    # detail line: hovered station, else city mean
+    # detail line: hovered station; else in a district view the station nearest
+    # its centre (most districts have none of their own); else the city mean
     y0 = my + mh + 20
     sel = next((s for s in view.stations if s.id == view.hover), None)
+    note = ""
+    if sel is None and view.district and view.stations:
+        sel = min(ranked or view.stations,      # prefer one that is actually reporting
+                  key=lambda s: distance_km(clat, clon, s.lat, s.lon))
+        note = f"nearest · {distance_km(clat, clon, sel.lat, sel.lon):.1f} km from centre"
     if sel:
         name = sel.name.split(",", 1)[-1].strip() or sel.name
         lab, col = INDEX[sel.index] if sel.index is not None else NO_INDEX
-        _text(ctx, name, 14, y0, 12, bold=True, maxw=W - 28)
+        if note:
+            _text(ctx, note, W - 14, y0, 10.5, dim, right=True)
+            _text(ctx, name, 14, y0, 12, bold=True, maxw=W - 40 - ctx.text_extents(note).x_advance)
+        else:
+            _text(ctx, name, 14, y0, 12, bold=True, maxw=W - 28)
         _text(ctx, lab, 14, y0 + 18, 11, col, bold=True)
         _text(ctx, f"PM10 {_fmt(sel.pm10)}   PM2.5 {_fmt(sel.pm25)}  µg/m³", W - 14, y0 + 18, 11, right=True)
     else:
@@ -434,7 +513,7 @@ def render(ctx, view: View) -> None:
 def load_tile_surfaces(view: View) -> None:
     import cairo
     _, _, mw, mh = map_rect()
-    for xy in tiles_for_view(mw, mh):
+    for xy in tiles_for_view(mw, mh, view.district):
         if xy in view.tiles:
             continue
         p = tile_path(*xy)
@@ -448,12 +527,18 @@ def load_tile_surfaces(view: View) -> None:
 # ----------------------------------------------------------------------------
 # 5. GTK shell
 # ----------------------------------------------------------------------------
-def run_gtk(demo: bool) -> None:
+def run_gtk(demo: bool, district: str | None = None) -> None:
     import gi
     gi.require_version("Gtk", "3.0")
     from gi.repository import Gdk, GLib, Gtk
 
-    view = View(demo=demo)
+    try:
+        saved = json.loads(STATE_FILE.read_text())
+    except Exception:
+        saved = {}
+    if district is None:
+        district = saved.get("district", "")
+    view = View(demo=demo, district=district if district in DISTRICTS else "")
     win = Gtk.Window(title="Warsaw smog")
     win.set_default_size(WIDTH, HEIGHT)
     win.set_resizable(False)
@@ -479,7 +564,7 @@ def run_gtk(demo: bool) -> None:
             err, stations = "", None
             try:
                 _, _, mw, mh = map_rect()
-                ensure_tiles(mw, mh)
+                ensure_tiles(mw, mh, view.district)
                 if demo:
                     stations = demo_stations()
                 else:
@@ -505,21 +590,66 @@ def run_gtk(demo: bool) -> None:
     def on_motion(_w, ev):
         hit = min(view.hits, key=lambda h: (h[0] - ev.x) ** 2 + (h[1] - ev.y) ** 2, default=None)
         hid = hit[2].id if hit and (hit[0] - ev.x) ** 2 + (hit[1] - ev.y) ** 2 <= 14 ** 2 else None
-        if hid != view.hover:
-            view.hover = hid
+        chip = in_chip(ev)
+        if hid != view.hover or chip != view.chip_hover:
+            view.hover, view.chip_hover = hid, chip
             area.queue_draw()
 
     def on_leave(_w, _ev):
-        if view.hover is not None:
-            view.hover = None
+        if view.hover is not None or view.chip_hover:
+            view.hover, view.chip_hover = None, False
             area.queue_draw()
 
+    def set_district(name):
+        if name == view.district:
+            return
+        view.district, view.hover = name, None
+        save_state()
+        load_tile_surfaces(view)        # whatever is cached shows immediately
+        area.queue_draw()
+
+        def work():                     # fetch the rest off the UI thread
+            _, _, mw, mh = map_rect()
+            ensure_tiles(mw, mh, name)
+            GLib.idle_add(lambda: (load_tile_surfaces(view), area.queue_draw()) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def in_chip(ev):
+        x, y, w, h = view.chip
+        return x <= ev.x <= x + w and y <= ev.y <= y + h
+
+    def district_menu():
+        sub = Gtk.Menu()
+        for name in ["", *sorted(DISTRICTS, key=PL_SORT_KEY)]:
+            item = Gtk.CheckMenuItem(label=name or "Whole city")
+            item.set_draw_as_radio(True)
+            item.set_active(name == view.district)      # before connect: no spurious signal
+            item.connect("activate", lambda _i, n=name: set_district(n))
+            sub.append(item)
+            if not name:
+                sub.append(Gtk.SeparatorMenuItem())
+        return sub
+
     def on_press(_w, ev):
-        if ev.button == 1:
+        if ev.button == 1 and in_chip(ev):
+            menu = district_menu()
+            menu.attach_to_widget(area)
+            win.menu = menu     # keep a reference while it is open
+            menu.show_all()
+            rect = Gdk.Rectangle()
+            rect.x, rect.y, rect.width, rect.height = (int(v) for v in view.chip)
+            menu.popup_at_rect(area.get_window(), rect,
+                               Gdk.Gravity.SOUTH_EAST, Gdk.Gravity.NORTH_EAST, ev)
+        elif ev.button == 1:
             win.begin_move_drag(ev.button, int(ev.x_root), int(ev.y_root), ev.time)
         elif ev.button == 3:
             menu = Gtk.Menu()
-            for text, cb in (("Refresh now", lambda *_: refresh()), ("Quit", save_position)):
+            menu.attach_to_widget(area)
+            sub = district_menu()
+            pick = Gtk.MenuItem(label="District")
+            pick.set_submenu(sub)
+            menu.append(pick)
+            for text, cb in (("Refresh now", lambda *_: refresh()), ("Quit", quit_app)):
                 item = Gtk.MenuItem(label=text)
                 item.connect("activate", cb)
                 menu.append(item)
@@ -527,22 +657,26 @@ def run_gtk(demo: bool) -> None:
             menu.show_all()
             menu.popup_at_pointer(ev)
 
-    def save_position(*_):
+    def save_state():
         try:
-            STATE_FILE.write_text(json.dumps({"pos": list(win.get_position())}))
+            STATE_FILE.write_text(json.dumps(
+                {"pos": list(win.get_position()), "district": view.district}, ensure_ascii=False))
         except OSError:
             pass
+
+    def quit_app(*_):
+        save_state()
         Gtk.main_quit()
 
     area.connect("draw", lambda _w, ctx: render(ctx, view))
     area.connect("motion-notify-event", on_motion)
     area.connect("leave-notify-event", on_leave)
     area.connect("button-press-event", on_press)
-    win.connect("delete-event", save_position)
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, save_position)   # SIGTERM at logout
+    win.connect("delete-event", quit_app)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, quit_app)   # SIGTERM at logout
 
     try:
-        x, y = json.loads(STATE_FILE.read_text())["pos"]
+        x, y = saved["pos"]
         win.move(int(x), int(y))
     except Exception:
         pass
@@ -553,12 +687,12 @@ def run_gtk(demo: bool) -> None:
     Gtk.main()
 
 
-def snapshot(path: str, demo: bool) -> None:
+def snapshot(path: str, demo: bool, district: str | None = None) -> None:
     """Render one frame to a PNG without opening a window."""
     import cairo
-    view = View(demo=demo, loading=False)
+    view = View(demo=demo, loading=False, district=district or "")
     _, _, mw, mh = map_rect()
-    ensure_tiles(mw, mh)
+    ensure_tiles(mw, mh, view.district)
     if demo:
         view.stations = demo_stations()
     else:
@@ -577,11 +711,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--demo", action="store_true", help="use built-in fake readings (no GIOŚ requests)")
     ap.add_argument("--snapshot", metavar="PNG", help="render one frame to a file and exit")
+    ap.add_argument("--district", choices=sorted(DISTRICTS, key=PL_SORT_KEY), metavar="NAME",
+                    help="start zoomed on a district (default: last one selected). One of: "
+                         + ", ".join(sorted(DISTRICTS, key=PL_SORT_KEY)))
     args = ap.parse_args()
     if args.snapshot:
-        snapshot(args.snapshot, args.demo)
+        snapshot(args.snapshot, args.demo, args.district)
     else:
-        run_gtk(args.demo)
+        run_gtk(args.demo, args.district)
 
 
 if __name__ == "__main__":
