@@ -30,6 +30,15 @@ round the district centre, sensors just across the boundary are included.
 District views are hand-placed centre points with a fixed zoom (the `DISTRICTS`
 table at the top of the script), not official boundaries.
 
+## The colour scale
+
+The bar under the readings is the Polish air quality index, very good to very
+bad. The white dot marks whatever the line above it describes: the sensor you
+are hovering, otherwise the district average (or the city mean in the
+whole-city view). Its position within a colour shows how far through that
+category's concentration range the value is, taking the worse of PM10 and
+PM2.5. No dot means no reading.
+
 ## Start at login
 
 Save as `~/.config/autostart/warsaw-smog.desktop` (fix the path):

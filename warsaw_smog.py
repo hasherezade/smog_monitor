@@ -836,6 +836,32 @@ def _marker(ctx, source: str, x: float, y: float, r: float) -> None:
     ctx.close_path()
 
 
+def scale_position(pm10: float | None, pm25: float | None, index: int | None = None) -> float | None:
+    """Where a reading sits on the six-segment colour scale: 0.0 .. 6.0.
+
+    The integer part is the category, the fraction how far through that
+    category's concentration range the value is; the worse of PM10 / PM2.5
+    decides, as for the index. The open-ended last category is given the same
+    width as the one before it. If an index is supplied and disagrees with the
+    PM values (a GIOŚ index can be driven by NO2 or O3, or the station may have
+    no PM sensor), the dot goes to the middle of that index's segment.
+    """
+    best = None
+    for key, v in (("pm10", pm10), ("pm25", pm25)):
+        if v is None:
+            continue
+        limits = (0,) + PL_INDEX_LIMITS[key]
+        cat = sum(v > limit for limit in limits[1:])
+        lo = limits[cat]
+        hi = limits[cat + 1] if cat + 1 < len(limits) else lo + (lo - limits[cat - 1])
+        pos = cat + min(max((v - lo) / (hi - lo), 0.0), 1.0)
+        best = pos if best is None else max(best, pos)
+    if index is not None and (best is None or min(int(best), len(INDEX) - 1) != index):
+        if best is None or not (index <= best <= index + 1):
+            return index + 0.5
+    return best
+
+
 def summarise(stations: list[Station]):
     """Average of a set of sensors: (index, mean PM10, mean PM2.5, last time, n).
 
@@ -993,6 +1019,7 @@ def render(ctx, view: View) -> None:
         note = (f"Community #{sel.id}" if sel.source == "Community" else sel.source) \
             + (f" · {sel.index_time[11:16]}" if sel.index_time else "")
     if sel:
+        pointer = scale_position(sel.pm10, sel.pm25, sel.index)
         name = sel.name.split(",", 1)[-1].strip() or sel.name
         lab, col = INDEX[sel.index] if sel.index is not None else NO_INDEX
         if note:
@@ -1004,6 +1031,7 @@ def render(ctx, view: View) -> None:
         _text(ctx, f"PM10 {_fmt(sel.pm10)}   PM2.5 {_fmt(sel.pm25)}  µg/m³", W - 14, y0 + 18, 11, right=True)
     elif view.district:
         idx, pm10, pm25, last, n = summarise([s for _, _, s in view.hits])
+        pointer = scale_position(pm10, pm25)
         lab, col = INDEX[idx] if idx is not None else NO_INDEX
         _text(ctx, view.district, 14, y0, 12, bold=True)
         if n:
@@ -1018,8 +1046,9 @@ def render(ctx, view: View) -> None:
     else:
         _text(ctx, "City mean", 14, y0, 12, bold=True)
         _text(ctx, "hover a station for details", W - 14, y0, 10.5, dim, right=True)
-        _text(ctx, f"PM10 {_fmt(_mean(s.pm10 for s in view.stations))}   "
-                   f"PM2.5 {_fmt(_mean(s.pm25 for s in view.stations))}  µg/m³", 14, y0 + 18, 11)
+        pm10, pm25 = _mean(s.pm10 for s in view.stations), _mean(s.pm25 for s in view.stations)
+        pointer = scale_position(pm10, pm25)
+        _text(ctx, f"PM10 {_fmt(pm10)}   PM2.5 {_fmt(pm25)}  µg/m³", 14, y0 + 18, 11)
 
     # legend
     ly, lw = y0 + 30, (W - 28) / len(INDEX)
@@ -1027,6 +1056,14 @@ def render(ctx, view: View) -> None:
         ctx.rectangle(14 + i * lw, ly, lw - 2, 5)
         ctx.set_source_rgb(*col)
         ctx.fill()
+    if pointer is not None:     # what the line above describes: hovered sensor or the average
+        px = min(max(14 + pointer * lw - 1, 14 + 5), W - 14 - 5)
+        ctx.arc(px, ly + 2.5, 5, 0, 2 * math.pi)
+        ctx.set_source_rgb(0.97, 0.98, 0.99)
+        ctx.fill_preserve()
+        ctx.set_line_width(2)
+        ctx.set_source_rgb(0.07, 0.09, 0.11)
+        ctx.stroke()
     _text(ctx, "very good", 14, ly + 16, 9, dim)
     _text(ctx, "very bad", W - 14, ly + 16, 9, dim, right=True)
     # marker key + attribution, only for the sources actually on screen
