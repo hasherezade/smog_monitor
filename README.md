@@ -13,6 +13,7 @@ sensors, coloured by the Polish air quality index.
 - Optional street labels next to every marker.
 - Auto-refresh every 5 to 60 minutes, plus a Refresh button.
 - Minimum, average and maximum readings for the current session, with a trend line.
+- History saved to CSV files for later comparison.
 
 ## Install and run
 
@@ -45,6 +46,38 @@ Other ways to start it:
 - **Right-click** anywhere for the same options and Quit.
 
 Your district, label and refresh settings are remembered.
+
+## History file
+
+Readings are also saved as CSV, one file per month, in
+`~/.local/share/warsaw-smog/` (for example `history-2026-11.csv`), so you can
+compare days and hours later in a spreadsheet or with a script. Right-click the
+widget to switch saving off ("Save history to CSV") or to open the folder.
+
+Each row is one new reading:
+
+| column | meaning |
+| --- | --- |
+| `recorded_at` | when the widget fetched it (local time with UTC offset) |
+| `measured_at` | the time the source gives for the measurement |
+| `kind` | `sensor`, `district` (average of the open district) or `city` (mean of the GIOŚ stations) |
+| `source` | `GIOŚ`, `Community`, or which average it is |
+| `id`, `name` | the sensor's number and street, or the district name |
+| `district` | the district that was open in the widget at the time (empty for the whole city) |
+| `lat`, `lon` | position of the sensor, or the centre of the district |
+| `pm10`, `pm25` | µg/m³; empty if not measured |
+| `category`, `category_name` | Polish index, 0 (very good) to 5 (very bad) |
+| `sensors` | for averages: how many sensors went into it |
+
+Good to know:
+
+- GIOŚ stations and the city mean are saved all the time. Community sensors
+  and a district's average are saved only while that district is open in the
+  widget, because that is when they are fetched.
+- Individual Airly sensor readings are not saved, because Airly's terms do not
+  allow building a database from its data. They still count towards the
+  district averages.
+- Made-up readings from `--demo` are never saved.
 
 ## Start at login
 
@@ -100,7 +133,8 @@ The widget contacts only these services, and sends no personal data:
 - `airapi.airly.eu`, only if you set an Airly key.
 
 It uses no third-party Python packages. Downloaded map tiles and street names
-are kept in `~/.cache/warsaw-smog/`, settings in `~/.config/warsaw-smog.json`.
+are kept in `~/.cache/warsaw-smog/`, settings in `~/.config/warsaw-smog.json`,
+history in `~/.local/share/warsaw-smog/`.
 
 ## Known limitations
 

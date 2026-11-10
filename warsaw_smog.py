@@ -22,6 +22,7 @@ Layout of this file:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -65,6 +66,15 @@ DISTRICTS = {
     "Żoliborz":       (52.270, 20.985, 12),
 }
 REFRESH_MINUTES = 30              # default; GIOŚ publishes hourly values
+# History on disk: one CSV per month in DATA_DIR, appended as readings arrive.
+# Individual Airly sensor readings are left out by default, because Airly's API
+# terms forbid building a database from its data (district averages, which
+# blend all sources, are still written). Set to True only if your agreement
+# with Airly allows it.
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "warsaw-smog"
+CSV_INCLUDE_AIRLY = False
+CSV_FIELDS = ["recorded_at", "measured_at", "kind", "source", "id", "name", "district",
+              "lat", "lon", "pm10", "pm25", "category", "category_name", "sensors"]
 HISTORY_MAX = 2000                # readings kept per sensor / district for this run (memory only)
 REFRESH_CHOICES = (5, 10, 15, 30, 60)   # offered in the widget, remembered between runs
 METADATA_TTL = 7 * 24 * 3600      # station / sensor lists rarely change
@@ -736,6 +746,7 @@ class View:
     hot: str = ""                              # "refresh" / "rate" while the pointer is on one
     labels: bool = False                       # draw a name next to every marker
     toggle: tuple = (0.0, 0.0, 0.0, 0.0)       # "labels" checkbox rect from last draw
+    log: "HistoryLog | None" = None                # CSV log; None = not saving (demo, snapshot)
     history: dict = field(default_factory=dict)    # key -> [(time, pm10, pm25, mark)], this run only
     tiles: dict = field(default_factory=dict)  # {(z, x, y): cairo surface}
 
@@ -870,16 +881,76 @@ def scale_position(pm10: float | None, pm25: float | None, index: int | None = N
     return best
 
 
+def _iso(ts) -> str:
+    """Local ISO 8601 time with UTC offset, from epoch seconds or 'YYYY-MM-DD HH:MM:SS'."""
+    from datetime import datetime
+    try:
+        d = datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) \
+            else datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        return d.astimezone().isoformat(timespec="seconds")
+    except (ValueError, TypeError, OSError):
+        return ""
+
+
+class HistoryLog:
+    """Appends readings to DATA_DIR/history-YYYY-MM.csv."""
+
+    def __init__(self, directory: Path | None = None):
+        self.dir = Path(directory) if directory else DATA_DIR
+        self.enabled = True
+        self.error = ""
+        self.last: dict[tuple, str] = {}    # (source, id) -> measured_at already on disk
+        try:                                # so a restart does not log the same measurement twice
+            with open(self.path(time.time()), newline="", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if r.get("kind") == "sensor" and r.get("measured_at"):
+                        self.last[(r.get("source"), r.get("id"))] = r["measured_at"]
+        except (OSError, csv.Error, UnicodeDecodeError):
+            pass
+
+    def path(self, now: float) -> Path:
+        return self.dir / f"history-{time.strftime('%Y-%m', time.localtime(now))}.csv"
+
+    def write(self, rows: list[dict], now: float) -> None:
+        if not self.enabled:
+            return
+        keep = []
+        for r in rows:
+            if r["kind"] == "sensor":
+                if r["source"] == "Airly" and not CSV_INCLUDE_AIRLY:
+                    continue
+                key = (r["source"], str(r["id"]))
+                if r["measured_at"] and self.last.get(key) == r["measured_at"]:
+                    continue
+                self.last[key] = r["measured_at"]
+            keep.append(r)
+        if not keep:
+            return
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            path = self.path(now)
+            new = not path.exists() or path.stat().st_size == 0
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+                if new:
+                    w.writeheader()
+                w.writerows(keep)
+            self.error = ""
+        except OSError as e:
+            self.error = f"history not saved ({e.strerror or type(e).__name__})"
+
+
 def record_history(view: "View", now: float | None = None) -> None:
-    """Add the current readings to this run's history (memory only, never saved).
+    """Add the current readings to this run's history, and to the CSV log if on.
 
     One series per sensor on screen, one for the open district's average and
     one for the city mean. A reading is added only when it differs from the
     last one recorded, so re-fetching unchanged data does not skew the stats.
     """
     now = time.time() if now is None else now
+    rows = []
 
-    def rec(key, pm10, pm25, mark):
+    def rec(key, pm10, pm25, mark, **row):
         if pm10 is None and pm25 is None:
             return
         series = view.history.setdefault(key, [])
@@ -887,17 +958,38 @@ def record_history(view: "View", now: float | None = None) -> None:
             return
         series.append((now, pm10, pm25, mark))
         del series[:-HISTORY_MAX]
+        cat = row.pop("category", None)
+        if cat is None:
+            cat = pl_index(pm10, pm25)
+        rows.append({
+            "recorded_at": _iso(now), "district": view.district,
+            "pm10": "" if pm10 is None else round(float(pm10), 1),
+            "pm25": "" if pm25 is None else round(float(pm25), 1),
+            "category": "" if cat is None else cat,
+            "category_name": "" if cat is None else INDEX[cat][0],
+            **row})
 
     visible = view.stations + (view.community + view.airly if view.district else [])
     for s in visible:
-        rec(s.uid, s.pm10, s.pm25, (s.index_time, s.pm10, s.pm25))
+        rec(s.uid, s.pm10, s.pm25, (s.index_time, s.pm10, s.pm25),
+            kind="sensor", source=s.source, id=s.id, measured_at=_iso(s.index_time),
+            name=s.name.split(",", 1)[-1].strip() if s.source == "GIOŚ" else s.name, lat=s.lat, lon=s.lon, category=s.index, sensors="")
     if view.district:
         _, _, mw, mh = map_rect()
-        _, pm10, pm25, last, _ = summarise(
+        clat, clon, _ = viewport(view.district)
+        _, pm10, pm25, last, n = summarise(
             [s for s in visible if in_view(s.lat, s.lon, view.district, mw, mh)])
-        rec("district:" + view.district, pm10, pm25, (last, pm10, pm25))
+        rec("district:" + view.district, pm10, pm25, (last, pm10, pm25),
+            kind="district", source="average", id="", measured_at=_iso(last),
+            name=view.district, lat=clat, lon=clon, sensors=n)
     pm10, pm25 = _mean(s.pm10 for s in view.stations), _mean(s.pm25 for s in view.stations)
-    rec("city", pm10, pm25, (max((s.index_time for s in view.stations), default=""), pm10, pm25))
+    last = max((s.index_time for s in view.stations), default="")
+    rec("city", pm10, pm25, (last, pm10, pm25),
+        kind="city", source="GIOŚ average", id="", measured_at=_iso(last), name=CITY,
+        lat=MAP_CENTER[0], lon=MAP_CENTER[1],
+        sensors=sum(s.pm10 is not None or s.pm25 is not None for s in view.stations))
+    if view.log is not None and rows:
+        view.log.write(rows, now)
 
 
 def history_stats(series: list) -> dict:
@@ -1210,8 +1302,9 @@ def render(ctx, view: View) -> None:
         ctx.fill()
     # footer: source status or error, then attribution (required by the data terms)
     extra = " · ".join(t for t in (view.airly_status, view.community_status, view.street_status) if t)
-    if view.error:
-        _text(ctx, view.error, 14, H - 23, 9, (0.95, 0.55, 0.45), maxw=W - 28)
+    problem = view.error or (view.log.error if view.log else "")
+    if problem:
+        _text(ctx, problem, 14, H - 23, 9, (0.95, 0.55, 0.45), maxw=W - 28)
     elif view.district and extra:
         _text(ctx, extra, 14, H - 23, 9, dim, maxw=W - 28)
     credit = ", ".join("Sensor.Community" if src == "Community" else src for src in shown)
@@ -1252,6 +1345,9 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     community = Community()
     geocoder = Geocoder()
     view.labels = bool(saved.get("labels", False))
+    if not demo:                        # demo readings are made up: never logged
+        view.log = HistoryLog()
+        view.log.enabled = bool(saved.get("csv", True))
     if saved.get("refresh_minutes") in REFRESH_CHOICES:
         view.refresh_minutes = saved["refresh_minutes"]
     timer = {"id": 0}
@@ -1410,6 +1506,14 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             GLib.idle_add(apply)
         threading.Thread(target=work, daemon=True).start()
 
+    def toggle_csv(*_):
+        view.log.enabled = not view.log.enabled
+        save_state()
+
+    def open_history(*_):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        Gtk.show_uri_on_window(win, DATA_DIR.as_uri(), Gdk.CURRENT_TIME)
+
     def toggle_labels(*_):
         view.labels = not view.labels
         save_state()
@@ -1467,6 +1571,14 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             rate = Gtk.MenuItem(label="Auto-refresh")
             rate.set_submenu(rate_menu())
             menu.append(rate)
+            if view.log is not None:
+                keep = Gtk.CheckMenuItem(label="Save history to CSV")
+                keep.set_active(view.log.enabled)
+                keep.connect("activate", toggle_csv)
+                menu.append(keep)
+                folder = Gtk.MenuItem(label="Open history folder")
+                folder.connect("activate", open_history)
+                menu.append(folder)
             for text, cb in (("Refresh now", refresh),
                              ("Open Airly map", lambda *_: Gtk.show_uri_on_window(
                                  win, "https://airly.org/map/en/", Gdk.CURRENT_TIME)),
@@ -1482,7 +1594,8 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         try:
             STATE_FILE.write_text(json.dumps(
                 {"pos": list(win.get_position()), "district": view.district, "labels": view.labels,
-                 "refresh_minutes": view.refresh_minutes}, ensure_ascii=False))
+                 "refresh_minutes": view.refresh_minutes,
+                 "csv": view.log.enabled if view.log else saved.get("csv", True)}, ensure_ascii=False))
         except OSError:
             pass
 
