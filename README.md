@@ -36,10 +36,13 @@ Other ways to start it:
   nothing hovered, a district view shows the average of all sensors in view
   and the time of the latest measurement.
 - **Colour scale:** the white dot marks the hovered sensor, or the average.
-- **This run:** under the scale you see the lowest, average and highest PM10
-  and PM2.5 since the widget was started, with a small trend line, for the
-  hovered sensor or else the district average. The history is kept only while
-  the widget runs. A district's history grows while that district is open.
+- **History:** under the scale you see the lowest, average and highest PM10
+  and PM2.5 so far, with a small trend line, for the hovered sensor or else the
+  district average. When the widget starts, today's earlier readings are loaded
+  from the history file, so the picture continues where it left off. A dashed
+  grey stretch of the line is an observation gap: no readings for over two
+  hours, for example while the widget was closed. Hover it to see from when to
+  when.
 - **Labels:** tick "labels" under the map to show a name next to every marker.
 - **Refresh:** the "Refresh" button fetches new data now; the selector next to
   it sets how often this happens automatically.
@@ -78,6 +81,8 @@ Good to know:
   allow building a database from its data. They still count towards the
   district averages.
 - Made-up readings from `--demo` are never saved.
+- Airly sensors' own history therefore starts afresh each time the widget is
+  started; everything else is reloaded for the current day.
 
 ## Install and start at login
 

@@ -71,11 +71,13 @@ REFRESH_MINUTES = 30              # default; GIOŚ publishes hourly values
 # terms forbid building a database from its data (district averages, which
 # blend all sources, are still written). Set to True only if your agreement
 # with Airly allows it.
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "warsaw-smog"
+_SHARE = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "warsaw-smog"
+DATA_DIR = _SHARE / "data"        # next to app/, where install.sh puts the widget
 CSV_INCLUDE_AIRLY = False
 CSV_FIELDS = ["recorded_at", "measured_at", "kind", "source", "id", "name", "district",
               "lat", "lon", "pm10", "pm25", "category", "category_name", "sensors"]
-HISTORY_MAX = 2000                # readings kept per sensor / district for this run (memory only)
+HISTORY_MAX = 2000                # readings kept in memory per sensor / district
+HISTORY_GAP = 2 * 3600            # readings further apart than this count as an observation gap
 REFRESH_CHOICES = (5, 10, 15, 30, 60)   # offered in the widget, remembered between runs
 METADATA_TTL = 7 * 24 * 3600      # station / sensor lists rarely change
 
@@ -743,11 +745,13 @@ class View:
     refreshing: bool = False
     btn_refresh: tuple = (0.0, 0.0, 0.0, 0.0)  # "Refresh" button rect from last draw
     rate_chip: tuple = (0.0, 0.0, 0.0, 0.0)    # auto-refresh selector rect from last draw
+    gaps: list = field(default_factory=list)   # [(x0, y0, x1, y1, t_from, t_to)] from last draw
+    gap_hover: tuple | None = None             # (t_from, t_to) of the gap under the pointer
     hot: str = ""                              # "refresh" / "rate" while the pointer is on one
     labels: bool = False                       # draw a name next to every marker
     toggle: tuple = (0.0, 0.0, 0.0, 0.0)       # "labels" checkbox rect from last draw
     log: "HistoryLog | None" = None                # CSV log; None = not saving (demo, snapshot)
-    history: dict = field(default_factory=dict)    # key -> [(time, pm10, pm25, mark)], this run only
+    history: dict = field(default_factory=dict)    # key -> [(time, pm10, pm25, mark)]: today + this run
     tiles: dict = field(default_factory=dict)  # {(z, x, y): cairo surface}
 
 
@@ -892,21 +896,101 @@ def _iso(ts) -> str:
         return ""
 
 
+def read_today(path: Path, today: str, block: int = 65536) -> list[dict]:
+    """Today's rows of a history CSV, oldest first, without reading the whole file.
+
+    Rows are appended in time order, so today's are a block at the end: the
+    file is read backwards from its end, a chunk at a time, and reading stops
+    at the first row recorded on another date. `today` is 'YYYY-MM-DD'.
+    Damaged lines (e.g. a write cut short by a crash) are skipped.
+    """
+    rows = []
+    try:
+        with open(path, "rb") as f:
+            fields = next(csv.reader([f.readline().decode("utf-8", "replace")]), [])
+            start = f.tell()                    # first data byte
+            pos = f.seek(0, os.SEEK_END)
+            tail = b""
+            while pos > start:
+                step = min(block, pos - start)
+                pos -= step
+                f.seek(pos)
+                lines = (f.read(step) + tail).split(b"\n")
+                # unless we are at the start, the first piece may be half a line
+                tail = lines.pop(0) if pos > start else b""
+                for raw in reversed(lines):
+                    text = raw.decode("utf-8", "replace").strip("\r")
+                    if not text:
+                        continue
+                    values = next(csv.reader([text]), [])
+                    if len(values) != len(fields):
+                        continue
+                    row = dict(zip(fields, values))
+                    if row.get("recorded_at", "")[:10] != today:
+                        return rows[::-1]
+                    rows.append(row)
+    except (OSError, csv.Error):
+        pass
+    return rows[::-1]
+
+
+def _mark(measured: str, pm10, pm25) -> tuple:
+    """Identity of a reading, in the precision the CSV keeps, so that a reading
+    restored from the file and the same one fetched live compare equal."""
+    r = lambda v: None if v is None else round(float(v), 1)
+    return (measured, r(pm10), r(pm25))
+
+
+def restore_history(view: "View", rows: list[dict]) -> int:
+    """Put rows from the CSV (see read_today) back into the on-screen history."""
+    from datetime import datetime
+    n = 0
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(r["recorded_at"]).timestamp()
+            pm10 = float(r["pm10"]) if r.get("pm10") else None
+            pm25 = float(r["pm25"]) if r.get("pm25") else None
+            kind = r["kind"]
+            key = {"sensor": f"{r['source']}:{r['id']}", "district": "district:" + r["name"],
+                   "city": "city"}[kind]
+        except (KeyError, ValueError, TypeError):
+            continue
+        if pm10 is None and pm25 is None:
+            continue
+        series = view.history.setdefault(key, [])
+        series.append((ts, pm10, pm25, _mark(r.get("measured_at", ""), pm10, pm25)))
+        del series[:-HISTORY_MAX]
+        n += 1
+    return n
+
+
 class HistoryLog:
     """Appends readings to DATA_DIR/history-YYYY-MM.csv."""
 
-    def __init__(self, directory: Path | None = None):
+    def __init__(self, directory: Path | None = None, now: float | None = None):
         self.dir = Path(directory) if directory else DATA_DIR
+        if not directory:
+            self._adopt_old_files()
         self.enabled = True
         self.error = ""
-        self.last: dict[tuple, str] = {}    # (source, id) -> measured_at already on disk
-        try:                                # so a restart does not log the same measurement twice
-            with open(self.path(time.time()), newline="", encoding="utf-8") as f:
-                for r in csv.DictReader(f):
-                    if r.get("kind") == "sensor" and r.get("measured_at"):
-                        self.last[(r.get("source"), r.get("id"))] = r["measured_at"]
-        except (OSError, csv.Error, UnicodeDecodeError):
-            pass
+        now = time.time() if now is None else now
+        # Today's rows: shown again in the widget (restore_history), and used so
+        # that a restart does not log the same measurement twice.
+        self.today_rows = read_today(self.path(now), time.strftime("%Y-%m-%d", time.localtime(now)))
+        self.last: dict[tuple, str] = {     # (source, id) -> measured_at already on disk
+            (r.get("source"), r.get("id")): r["measured_at"]
+            for r in self.today_rows if r.get("kind") == "sensor" and r.get("measured_at")}
+
+    def _adopt_old_files(self) -> None:
+        """Earlier versions wrote the CSVs one level up; move them into data/."""
+        try:
+            for old in _SHARE.glob("history-*.csv"):
+                new = self.dir / old.name
+                if not new.exists():
+                    self.dir.mkdir(parents=True, exist_ok=True)
+                    old.rename(new)
+        except OSError:
+            pass                # leave them where they are; nothing is lost
 
     def path(self, now: float) -> Path:
         return self.dir / f"history-{time.strftime('%Y-%m', time.localtime(now))}.csv"
@@ -941,7 +1025,7 @@ class HistoryLog:
 
 
 def record_history(view: "View", now: float | None = None) -> None:
-    """Add the current readings to this run's history, and to the CSV log if on.
+    """Add the current readings to the on-screen history, and to the CSV log if on.
 
     One series per sensor on screen, one for the open district's average and
     one for the city mean. A reading is added only when it differs from the
@@ -950,9 +1034,11 @@ def record_history(view: "View", now: float | None = None) -> None:
     now = time.time() if now is None else now
     rows = []
 
-    def rec(key, pm10, pm25, mark, **row):
+    def rec(key, pm10, pm25, measured, **row):
         if pm10 is None and pm25 is None:
             return
+        measured = _iso(measured)
+        mark = _mark(measured, pm10, pm25)
         series = view.history.setdefault(key, [])
         if series and series[-1][3] == mark:
             return
@@ -962,7 +1048,7 @@ def record_history(view: "View", now: float | None = None) -> None:
         if cat is None:
             cat = pl_index(pm10, pm25)
         rows.append({
-            "recorded_at": _iso(now), "district": view.district,
+            "recorded_at": _iso(now), "measured_at": measured, "district": view.district,
             "pm10": "" if pm10 is None else round(float(pm10), 1),
             "pm25": "" if pm25 is None else round(float(pm25), 1),
             "category": "" if cat is None else cat,
@@ -971,21 +1057,21 @@ def record_history(view: "View", now: float | None = None) -> None:
 
     visible = view.stations + (view.community + view.airly if view.district else [])
     for s in visible:
-        rec(s.uid, s.pm10, s.pm25, (s.index_time, s.pm10, s.pm25),
-            kind="sensor", source=s.source, id=s.id, measured_at=_iso(s.index_time),
-            name=s.name.split(",", 1)[-1].strip() if s.source == "GIOŚ" else s.name, lat=s.lat, lon=s.lon, category=s.index, sensors="")
+        name = s.name.split(",", 1)[-1].strip() if s.source == "GIOŚ" else s.name
+        rec(s.uid, s.pm10, s.pm25, s.index_time,
+            kind="sensor", source=s.source, id=s.id, name=" ".join(name.split()),
+            lat=s.lat, lon=s.lon, category=s.index, sensors="")
     if view.district:
         _, _, mw, mh = map_rect()
         clat, clon, _ = viewport(view.district)
         _, pm10, pm25, last, n = summarise(
             [s for s in visible if in_view(s.lat, s.lon, view.district, mw, mh)])
-        rec("district:" + view.district, pm10, pm25, (last, pm10, pm25),
-            kind="district", source="average", id="", measured_at=_iso(last),
-            name=view.district, lat=clat, lon=clon, sensors=n)
+        rec("district:" + view.district, pm10, pm25, last,
+            kind="district", source="average", id="", name=view.district,
+            lat=clat, lon=clon, sensors=n)
     pm10, pm25 = _mean(s.pm10 for s in view.stations), _mean(s.pm25 for s in view.stations)
-    last = max((s.index_time for s in view.stations), default="")
-    rec("city", pm10, pm25, (last, pm10, pm25),
-        kind="city", source="GIOŚ average", id="", measured_at=_iso(last), name=CITY,
+    rec("city", pm10, pm25, max((s.index_time for s in view.stations), default=""),
+        kind="city", source="GIOŚ average", id="", name=CITY,
         lat=MAP_CENTER[0], lon=MAP_CENTER[1],
         sensors=sum(s.pm10 is not None or s.pm25 is not None for s in view.stations))
     if view.log is not None and rows:
@@ -999,6 +1085,15 @@ def history_stats(series: list) -> dict:
         vals = [r[col] for r in series if r[col] is not None]
         out[key] = (min(vals), sum(vals) / len(vals), max(vals)) if vals else None
     return out
+
+
+def gap_text(t_from: float, t_to: float) -> str:
+    """Hover description of an observation gap in the trend line."""
+    mins = int(round((t_to - t_from) / 60))
+    length = f"{mins // 60} h {mins % 60:02d} min" if mins >= 60 else f"{mins} min"
+    day = "%H:%M" if time.localtime(t_from)[:3] == time.localtime(t_to)[:3] else "%d %b %H:%M"
+    return (f"observation gap · {time.strftime(day, time.localtime(t_from))} – "
+            f"{time.strftime(day, time.localtime(t_to))} · no readings for {length}")
 
 
 def rate_label(minutes: int) -> str:
@@ -1257,16 +1352,21 @@ def render(ctx, view: View) -> None:
     _text(ctx, "very good", 14, ly + 16, 9, dim)
     _text(ctx, "very bad", W - 14, ly + 16, 9, dim, right=True)
 
-    # stats for this run, for the same thing the lines above describe
+    # stats since the first reading today (earlier ones are reloaded from the CSV
+    # at start), for the same thing the lines above describe
     sy = ly + 26
     series = view.history.get(hist_key, [])
     st = history_stats(series)
     if st["n"]:
-        head = (f"this run · since {time.strftime('%H:%M', time.localtime(st['since']))}"
-                f" · {st['n']} reading{'s' * (st['n'] != 1)}")
+        first = time.localtime(st["since"])     # date too, once a run spans midnight
+        fmt = "%H:%M" if first[:3] == time.localtime()[:3] else "%d %b %H:%M"
+        head = f"history · since {time.strftime(fmt, first)} · {st['n']} reading{'s' * (st['n'] != 1)}"
     else:
-        head = "this run · no readings yet"
-    _text(ctx, head, 14, sy + 9, 9, dim)
+        head = "history · no readings yet"
+    if view.gap_hover:              # pointer is on a dashed part of the trend line
+        _text(ctx, gap_text(*view.gap_hover), 14, sy + 9, 9, (0.92, 0.94, 0.96), maxw=W - 28)
+    else:
+        _text(ctx, head, 14, sy + 9, 9, dim)
     for row, (key, name) in enumerate((("pm10", "PM10"), ("pm25", "PM2.5"))):
         yy = sy + 25 + row * 15
         _text(ctx, name, 14, yy, 10, dim)
@@ -1283,6 +1383,7 @@ def render(ctx, view: View) -> None:
     pts = [(t, scale_position(a, b)) for t, a, b, _ in series]
     pts = [(t, v) for t, v in pts if v is not None]
     gx, gy, gw, gh = W - 14 - 104.0, sy + 15.0, 104.0, 26.0
+    view.gaps = []
     if pts:
         t0, t1 = pts[0][0], pts[-1][0]
         lo, hi = min(v for _, v in pts), max(v for _, v in pts)
@@ -1291,7 +1392,22 @@ def render(ctx, view: View) -> None:
         xy = [(gx + (gw * (t - t0) / (t1 - t0) if t1 > t0 else gw), gy + gh * (1 - (v - lo) / (hi - lo)), v)
               for t, v in pts]
         ctx.set_line_width(1.6)
-        for (xa, ya, _), (xb, yb, vb) in zip(xy, xy[1:]):
+        for k, ((xa, ya, _), (xb, yb, vb)) in enumerate(zip(xy, xy[1:])):
+            if pts[k + 1][0] - pts[k][0] > HISTORY_GAP:
+                # widget was off / district closed: a dashed grey line, not data
+                span = (pts[k][0], pts[k + 1][0])
+                pad = max(0.0, 8 - (xb - xa)) / 2        # keep narrow gaps hoverable
+                view.gaps.append((xa - pad, gy - 4, xb + pad, gy + gh + 4, *span))
+                ctx.move_to(xa, ya)
+                ctx.line_to(xb, yb)
+                ctx.set_dash([3, 3])
+                ctx.set_source_rgb(*((0.92, 0.94, 0.96) if view.gap_hover == span else NO_INDEX[1]))
+                ctx.stroke()
+                ctx.set_dash([])
+                ctx.arc(xb, yb, 1.2, 0, 2 * math.pi)     # where readings resume
+                ctx.set_source_rgb(*INDEX[min(int(vb), len(INDEX) - 1)][1])
+                ctx.fill()
+                continue
             ctx.move_to(xa, ya)
             ctx.line_to(xb, yb)
             ctx.set_source_rgb(*INDEX[min(int(vb), len(INDEX) - 1)][1])
@@ -1347,6 +1463,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     view.labels = bool(saved.get("labels", False))
     if not demo:                        # demo readings are made up: never logged
         view.log = HistoryLog()
+        restore_history(view, view.log.today_rows)      # today's earlier readings
         view.log.enabled = bool(saved.get("csv", True))
     if saved.get("refresh_minutes") in REFRESH_CHOICES:
         view.refresh_minutes = saved["refresh_minutes"]
@@ -1429,13 +1546,15 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         hid = hit[2].uid if hit and (hit[0] - ev.x) ** 2 + (hit[1] - ev.y) ** 2 <= 14 ** 2 else None
         chip = in_chip(ev)
         hot = "refresh" if inside(view.btn_refresh, ev) else "rate" if inside(view.rate_chip, ev) else ""
-        if hid != view.hover or chip != view.chip_hover or hot != view.hot:
-            view.hover, view.chip_hover, view.hot = hid, chip, hot
+        gap = next(((g[4], g[5]) for g in view.gaps
+                    if g[0] <= ev.x <= g[2] and g[1] <= ev.y <= g[3]), None)
+        if hid != view.hover or chip != view.chip_hover or hot != view.hot or gap != view.gap_hover:
+            view.hover, view.chip_hover, view.hot, view.gap_hover = hid, chip, hot, gap
             area.queue_draw()
 
     def on_leave(_w, _ev):
-        if view.hover is not None or view.chip_hover or view.hot:
-            view.hover, view.chip_hover, view.hot = None, False, ""
+        if view.hover is not None or view.chip_hover or view.hot or view.gap_hover:
+            view.hover, view.chip_hover, view.hot, view.gap_hover = None, False, "", None
             area.queue_draw()
 
     def inside(rect, ev):
@@ -1475,7 +1594,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     def set_district(name):
         if name == view.district:
             return
-        view.district, view.hover = name, None
+        view.district, view.hover, view.gap_hover = name, None, None
         view.airly, view.airly_status = [], ("Airly: loading…" if name and airly else "")
         view.community, view.community_status = [], ("Community: loading…" if name else "")
         view.street_status = ""
