@@ -101,6 +101,15 @@ SC_URL = "https://data.sensor.community/airrohr/v1/filter/area={lat},{lon},{km}"
 SC_RADIUS_KM = 20
 SC_MAX_AGE = 10 * 60              # reuse the area snapshot for this long
 
+# Community sensors come without an address, so the street is looked up from
+# the coordinates with OSM's Nominatim. Its usage policy: at most 1 request per
+# second, identify yourself, cache results. Each sensor is looked up once and
+# kept in ~/.cache/warsaw-smog/geocode.json. Note that Sensor.Community blurs
+# sensor positions on purpose, so the street is "near", not exact.
+GEOCODE_URL = ("https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=17"
+               "&addressdetails=1&accept-language=pl&lat={lat}&lon={lon}")
+GEOCODE_INTERVAL = 1.1            # seconds between lookups
+
 # Polish air quality index, 0 (best) .. 5 (worst). Colours follow the GIOŚ portal.
 INDEX = [
     ("Very good",  (0.34, 0.69, 0.03)),
@@ -506,6 +515,72 @@ def parse_community(rows: list) -> list[Station]:
     return out
 
 
+def parse_geocode(doc: dict) -> str:
+    """Street (or the closest thing to one) from a Nominatim reverse result."""
+    a = doc.get("address") or {}
+    for k in ("road", "pedestrian", "square", "residential", "neighbourhood", "quarter", "suburb"):
+        if a.get(k):
+            return str(a[k])
+    return ""
+
+
+class Geocoder:
+    """Coordinates -> street name, rate-limited and cached on disk for good."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.path = CACHE_DIR / "geocode.json"
+        self.last = 0.0
+        try:
+            self.cache = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            self.cache = {}
+
+    @staticmethod
+    def _key(s: Station) -> str:
+        return f"{s.lat:.5f},{s.lon:.5f}"
+
+    def apply(self, stations: list[Station]) -> None:
+        """Name the stations we already know; no network."""
+        for s in stations:
+            road = self.cache.get(self._key(s))
+            if road:
+                s.name = f"near {road}"
+
+    def resolve(self, stations: list[Station], on_progress=lambda text: None,
+                wanted=lambda: True) -> None:
+        """Preload the street of every community sensor given, one lookup per
+        GEOCODE_INTERVAL. Call from a worker thread; on_progress gets a short
+        status text ("" when everything is loaded). Stops if wanted() turns false."""
+        todo = [s for s in stations if s.source == "Community"]
+        for n, s in enumerate(todo, 1):
+            if not wanted():
+                return
+            with self.lock:
+                key = self._key(s)
+                fetched = key not in self.cache
+                if fetched:
+                    time.sleep(max(0.0, self.last + GEOCODE_INTERVAL - time.time()))
+                    self.last = time.time()
+                    try:
+                        lat, lon = key.split(",")
+                        road = parse_geocode(get_json(GEOCODE_URL.format(lat=lat, lon=lon)))
+                    except Exception as e:      # offline, blocked or throttled: say so,
+                        on_progress(f"street lookup failed ({type(e).__name__})")
+                        return                  # and try again on the next refresh
+                    self.cache[key] = road      # "" is cached too: nothing to find there
+                    try:
+                        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                        self.path.write_text(json.dumps(self.cache, ensure_ascii=False))
+                    except OSError:
+                        pass                    # still held in memory for this session
+            if self.cache.get(key):
+                s.name = f"near {self.cache[key]}"
+            if fetched:
+                on_progress(f"streets {n}/{len(todo)}")
+        on_progress("")
+
+
 class Community:
     def __init__(self):
         self.lock = threading.Lock()
@@ -520,7 +595,8 @@ class Community:
             return self.sensors
 
 
-def community_view(client: "Community | None", district: str, demo: bool) -> tuple[list[Station], str]:
+def community_view(client: "Community | None", district: str, demo: bool,
+                   geocoder: "Geocoder | None" = None) -> tuple[list[Station], str]:
     """Community sensors inside the given district view. Never raises."""
     if not district:
         return [], ""           # too dense for the city view
@@ -530,6 +606,8 @@ def community_view(client: "Community | None", district: str, demo: bool) -> tup
     except Exception as e:
         return [], f"Community unavailable ({type(e).__name__})"
     shown = [s for s in sensors if in_view(s.lat, s.lon, district, mw, mh)]
+    if geocoder and not demo:
+        geocoder.apply(shown)   # cached streets only; new ones are resolved afterwards
     return shown, f"Community: {len(shown)}"
 
 
@@ -539,7 +617,7 @@ def demo_community(district: str) -> list[Station]:
     pts = [(0.020, -0.034, 25, 15), (0.007, -0.006, 55, 36), (-0.003, -0.030, 41, 30),
            (-0.020, 0.012, 88, 57), (0.014, 0.020, 33, 14), (-0.011, 0.034, 70, 49),
            (-0.024, -0.026, 120, 82)]
-    return [Station(1000 + i, f"Community sensor #{1000 + i}", clat + dy, clon + dx,
+    return [Station(1000 + i, f"near Demo street {i + 1}", clat + dy, clon + dx,
                     index=pl_index(p10, p25), index_time="2026-11-10 14:03:00",
                     pm10=p10, pm25=p25, source="Community")
             for i, (dy, dx, p10, p25) in enumerate(pts)]
@@ -643,11 +721,14 @@ class View:
     airly_status: str = ""
     community: list[Station] = field(default_factory=list)
     community_status: str = ""
+    street_status: str = ""           # progress of the street preload
     demo: bool = False
     district: str = ""                # "" = whole city, else a key of DISTRICTS
     hits: list = field(default_factory=list)   # [(x, y, station)] from last draw
     chip: tuple = (0.0, 0.0, 0.0, 0.0)         # district selector rect from last draw
     chip_hover: bool = False
+    labels: bool = False                       # draw a name next to every marker
+    toggle: tuple = (0.0, 0.0, 0.0, 0.0)       # "labels" checkbox rect from last draw
     tiles: dict = field(default_factory=dict)  # {(z, x, y): cairo surface}
 
 
@@ -677,6 +758,62 @@ def _text(ctx, s, x, y, size=11.0, rgb=(0.92, 0.94, 0.96), bold=False, right=Fal
     ctx.set_source_rgb(*rgb)
     ctx.move_to(x, y)
     ctx.show_text(s)
+
+
+def short_label(s: Station) -> str:
+    """Compact marker label: the street, or the sensor number if none is known."""
+    if s.source == "Community" and s.name.startswith("Community sensor"):
+        return f"#{s.id}"
+    n = s.name.split(",", 1)[-1].strip()
+    for prefix in ("near ", "ul. ", "ulica "):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
+    return n
+
+
+def _overlap(a, b) -> float:
+    """Overlapping area of two (x, y, w, h) boxes."""
+    w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+    h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+    return w * h if w > 0 and h > 0 else 0.0
+
+
+def place_labels(markers: list, bounds: tuple, fixed: list = ()) -> list:
+    """Choose a box for every label; none is ever dropped.
+
+    markers: [(x, y, label_width)] in priority order. For each, eight positions
+    round the marker are tried and the one covering the least of what is
+    already there (earlier labels, other markers, fixed UI boxes, the map edge)
+    wins. In a tight cluster that can still mean some overlap, which is better
+    than a missing label.
+    """
+    H, G = 13.0, 10.0                       # label height, gap from marker centre
+    bx, by, bw, bh = bounds
+    dots = [(x - 8, y - 8, 16, 16) for x, y, _ in markers]
+    placed = []
+    for i, (x, y, w) in enumerate(markers):
+        candidates = [
+            (x + G, y - H / 2),             # right (preferred)
+            (x - G - w, y - H / 2),         # left
+            (x - w / 2, y - G - H),         # above
+            (x - w / 2, y + G),             # below
+            (x + G - 3, y - G - H + 3),     # upper right
+            (x + G - 3, y + G - 3),         # lower right
+            (x - G - w + 3, y - G - H + 3), # upper left
+            (x - G - w + 3, y + G - 3),     # lower left
+        ]
+        best, best_cost = None, None
+        for rank, (cx, cy) in enumerate(candidates):
+            box = (cx, cy, w, H)
+            outside = w * H - _overlap(box, (bx + 2, by + 2, bw - 4, bh - 4))
+            cost = (4 * sum(_overlap(box, b) for b in placed)
+                    + 4 * sum(_overlap(box, b) for b in fixed)
+                    + 2 * sum(_overlap(box, d) for k, d in enumerate(dots) if k != i)
+                    + 6 * outside + 0.01 * rank)
+            if best_cost is None or cost < best_cost:
+                best, best_cost = box, cost
+        placed.append(best)
+    return placed
 
 
 SOURCE_RANK = {"Community": 0, "Airly": 1, "GIOŚ": 2}     # draw order, reference on top
@@ -791,7 +928,45 @@ def render(ctx, view: View) -> None:
         ctx.set_line_width(2.2 if hovered else 1.4)
         ctx.set_source_rgba(1, 1, 1, 0.95 if hovered else 0.75)
         ctx.stroke()
-    extra = " · ".join(t for t in (view.airly_status, view.community_status) if t)
+    # always-on labels (the "labels" checkbox): every marker gets one
+    if view.labels:
+        ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        ctx.set_font_size(8.5)
+        items = []
+        for x, y, s in sorted(view.hits, key=lambda h: -SOURCE_RANK[h[2].source]):
+            t = short_label(s)
+            while len(t) > 4 and ctx.text_extents(t).x_advance > 110:
+                t = t[:-2].rstrip() + "…"
+            if t:
+                items.append((x, y, ctx.text_extents(t).x_advance + 6, t))
+        fixed = [(mx + 6, my + 6, 62, 18)]                      # the checkbox
+        if view.district and (view.airly_status or view.community_status):
+            fixed.append((mx + 6, my + mh - 24, mw * 0.62, 18))  # the status line
+        for (x, y, w, t), box in zip(items, place_labels(
+                [(x, y, w) for x, y, w, _ in items], (mx, my, mw, mh), fixed)):
+            _rounded(ctx, *box, 4)
+            ctx.set_source_rgba(0.07, 0.09, 0.11, 0.78)
+            ctx.fill()
+            _text(ctx, t, box[0] + 3, box[1] + 10, 8.5, (0.88, 0.90, 0.93))
+    # the checkbox itself, top-left corner of the map
+    view.toggle = (mx + 6, my + 6, 62, 18)
+    _rounded(ctx, *view.toggle, 6)
+    ctx.set_source_rgba(0.07, 0.09, 0.11, 0.80)
+    ctx.fill()
+    bx, by = mx + 12, my + 10
+    ctx.rectangle(bx + 0.5, by + 0.5, 9, 9)
+    ctx.set_line_width(1)
+    ctx.set_source_rgba(1, 1, 1, 0.75)
+    ctx.stroke()
+    if view.labels:
+        ctx.move_to(bx + 2, by + 5)
+        ctx.line_to(bx + 4.2, by + 7.5)
+        ctx.line_to(bx + 8, by + 2.5)
+        ctx.set_line_width(1.6)
+        ctx.set_source_rgb(0.92, 0.94, 0.96)
+        ctx.stroke()
+    _text(ctx, "labels", bx + 15, by + 8.5, 9, (0.80, 0.83, 0.87))
+    extra = " · ".join(t for t in (view.airly_status, view.community_status, view.street_status) if t)
     if view.district and extra:
         ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         ctx.set_font_size(9)
@@ -808,7 +983,8 @@ def render(ctx, view: View) -> None:
     sel = next((s for s in visible if s.uid == view.hover), None)
     note = ""
     if sel is not None:
-        note = sel.source + (f" · {sel.index_time[11:16]}" if sel.index_time else "")
+        note = (f"Community #{sel.id}" if sel.source == "Community" else sel.source) \
+            + (f" · {sel.index_time[11:16]}" if sel.index_time else "")
     elif view.district and visible:
         sel = min([s for s in visible if s.index is not None] or visible,   # prefer a reporting one
                   key=lambda s: distance_km(clat, clon, s.lat, s.lon))
@@ -895,6 +1071,20 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     key = airly_key()
     airly = Airly(key) if key else None
     community = Community()
+    geocoder = Geocoder()
+    view.labels = bool(saved.get("labels", False))
+
+    def preload_streets(stations, d):
+        """Start loading every street for district d now, in its own thread."""
+        def progress(text):
+            def ui():
+                if view.district == d:
+                    view.street_status = text
+                    area.queue_draw()
+            GLib.idle_add(ui)
+        threading.Thread(target=geocoder.resolve, daemon=True,
+                         args=(stations, progress, lambda: view.district == d)).start()
+
     win = Gtk.Window(title="Warsaw smog")
     win.set_default_size(WIDTH, HEIGHT)
     win.set_resizable(False)
@@ -931,7 +1121,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             except Exception as e:
                 err = f"{type(e).__name__}: {getattr(e, 'reason', e)}"
             air = airly_view(airly, d, demo)       # independent of GIOŚ succeeding
-            com = community_view(community, d, demo)
+            com = community_view(community, d, demo, geocoder)
 
             def apply():
                 view.loading = False
@@ -944,6 +1134,8 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
                 load_tile_surfaces(view)
                 area.queue_draw()
             GLib.idle_add(apply)
+            if not demo:    # sensors that appeared since the district was opened
+                preload_streets(com[0], d)
 
         threading.Thread(target=work, daemon=True).start()
         return True     # keep the GLib timer running
@@ -967,6 +1159,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         view.district, view.hover = name, None
         view.airly, view.airly_status = [], ("Airly: loading…" if name and airly else "")
         view.community, view.community_status = [], ("Community: loading…" if name else "")
+        view.street_status = ""
         save_state()
         load_tile_surfaces(view)        # whatever is cached shows immediately
         area.queue_draw()
@@ -975,13 +1168,15 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             _, _, mw, mh = map_rect()
             ensure_tiles(mw, mh, name)
             GLib.idle_add(lambda: (load_tile_surfaces(view), area.queue_draw()) and False)
-            com = community_view(community, name, demo)
+            com = community_view(community, name, demo, geocoder)
 
             def apply_com():                # one request, arrives first
                 if view.district == name:
                     view.community, view.community_status = com
                     area.queue_draw()
             GLib.idle_add(apply_com)
+            if not demo:                    # all streets, straight away, alongside Airly
+                preload_streets(com[0], name)
             air = airly_view(airly, name, demo)
 
             def apply():
@@ -990,6 +1185,15 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
                     area.queue_draw()
             GLib.idle_add(apply)
         threading.Thread(target=work, daemon=True).start()
+
+    def toggle_labels(*_):
+        view.labels = not view.labels
+        save_state()
+        area.queue_draw()
+
+    def in_toggle(ev):
+        x, y, w, h = view.toggle
+        return x <= ev.x <= x + w and y <= ev.y <= y + h
 
     def in_chip(ev):
         x, y, w, h = view.chip
@@ -1008,7 +1212,9 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         return sub
 
     def on_press(_w, ev):
-        if ev.button == 1 and in_chip(ev):
+        if ev.button == 1 and in_toggle(ev):
+            toggle_labels()
+        elif ev.button == 1 and in_chip(ev):
             menu = district_menu()
             menu.attach_to_widget(area)
             win.menu = menu     # keep a reference while it is open
@@ -1026,6 +1232,10 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             pick = Gtk.MenuItem(label="District")
             pick.set_submenu(sub)
             menu.append(pick)
+            lab = Gtk.CheckMenuItem(label="Show labels")
+            lab.set_active(view.labels)
+            lab.connect("activate", toggle_labels)
+            menu.append(lab)
             for text, cb in (("Refresh now", lambda *_: refresh()),
                              ("Open Airly map", lambda *_: Gtk.show_uri_on_window(
                                  win, "https://airly.org/map/en/", Gdk.CURRENT_TIME)),
@@ -1040,7 +1250,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     def save_state():
         try:
             STATE_FILE.write_text(json.dumps(
-                {"pos": list(win.get_position()), "district": view.district}, ensure_ascii=False))
+                {"pos": list(win.get_position()), "district": view.district, "labels": view.labels}, ensure_ascii=False))
         except OSError:
             pass
 
@@ -1067,7 +1277,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     Gtk.main()
 
 
-def snapshot(path: str, demo: bool, district: str | None = None) -> None:
+def snapshot(path: str, demo: bool, district: str | None = None, labels: bool = False) -> None:
     """Render one frame to a PNG without opening a window."""
     import cairo
     view = View(demo=demo, loading=False, district=district or "")
@@ -1081,7 +1291,11 @@ def snapshot(path: str, demo: bool, district: str | None = None) -> None:
     view.updated = time.time()
     key = airly_key()
     view.airly, view.airly_status = airly_view(Airly(key) if key else None, view.district, demo)
-    view.community, view.community_status = community_view(Community(), view.district, demo)
+    geocoder = Geocoder()
+    view.labels = labels
+    view.community, view.community_status = community_view(Community(), view.district, demo, geocoder)
+    if not demo:
+        geocoder.resolve(view.community)
     load_tile_surfaces(view)
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH * 2, HEIGHT * 2)
     ctx = cairo.Context(surf)
@@ -1097,9 +1311,10 @@ def main() -> None:
     ap.add_argument("--district", choices=sorted(DISTRICTS, key=PL_SORT_KEY), metavar="NAME",
                     help="start zoomed on a district (default: last one selected). One of: "
                          + ", ".join(sorted(DISTRICTS, key=PL_SORT_KEY)))
+    ap.add_argument("--labels", action="store_true", help="with --snapshot: draw marker labels")
     args = ap.parse_args()
     if args.snapshot:
-        snapshot(args.snapshot, args.demo, args.district)
+        snapshot(args.snapshot, args.demo, args.district, args.labels)
     else:
         run_gtk(args.demo, args.district)
 
