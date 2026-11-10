@@ -836,6 +836,18 @@ def _marker(ctx, source: str, x: float, y: float, r: float) -> None:
     ctx.close_path()
 
 
+def summarise(stations: list[Station]):
+    """Average of a set of sensors: (index, mean PM10, mean PM2.5, last time, n).
+
+    Every sensor with a reading counts equally, whatever its source. The index
+    is the Polish category of the mean concentrations, not a mean of categories.
+    """
+    live = [s for s in stations if s.pm10 is not None or s.pm25 is not None]
+    pm10, pm25 = _mean(s.pm10 for s in live), _mean(s.pm25 for s in live)
+    last = max((s.index_time for s in live if s.index_time), default="")
+    return pl_index(pm10, pm25), pm10, pm25, last, len(live)
+
+
 def _fmt(v):
     return "–" if v is None else f"{v:.0f}"
 
@@ -972,18 +984,14 @@ def render(ctx, view: View) -> None:
             extra = extra[:-2].rstrip() + "…"
         _text(ctx, extra, W - 14, by + 8.5, 9, dim, right=True)
 
-    # detail line: hovered station; else in a district view the station nearest
-    # its centre (most districts have none of their own); else the city mean
+    # detail line: hovered station; else the average of the district view;
+    # else (whole city) the city mean
     y0 = my + mh + 42
     sel = next((s for s in visible if s.uid == view.hover), None)
     note = ""
     if sel is not None:
         note = (f"Community #{sel.id}" if sel.source == "Community" else sel.source) \
             + (f" · {sel.index_time[11:16]}" if sel.index_time else "")
-    elif view.district and visible:
-        sel = min([s for s in visible if s.index is not None] or visible,   # prefer a reporting one
-                  key=lambda s: distance_km(clat, clon, s.lat, s.lon))
-        note = f"nearest to centre · {distance_km(clat, clon, sel.lat, sel.lon):.1f} km"
     if sel:
         name = sel.name.split(",", 1)[-1].strip() or sel.name
         lab, col = INDEX[sel.index] if sel.index is not None else NO_INDEX
@@ -994,6 +1002,19 @@ def render(ctx, view: View) -> None:
             _text(ctx, name, 14, y0, 12, bold=True, maxw=W - 28)
         _text(ctx, lab, 14, y0 + 18, 11, col, bold=True)
         _text(ctx, f"PM10 {_fmt(sel.pm10)}   PM2.5 {_fmt(sel.pm25)}  µg/m³", W - 14, y0 + 18, 11, right=True)
+    elif view.district:
+        idx, pm10, pm25, last, n = summarise([s for _, _, s in view.hits])
+        lab, col = INDEX[idx] if idx is not None else NO_INDEX
+        _text(ctx, view.district, 14, y0, 12, bold=True)
+        if n:
+            info = f"{n} sensor{'s' * (n != 1)}" + (f" · last measurement {last[11:16]}" if last else "")
+        else:
+            info = "loading…" if view.loading else "no sensors reporting here"
+        _text(ctx, info, W - 14, y0, 10.5, dim, right=True)
+        _text(ctx, "average: ", 14, y0 + 18, 11, dim)
+        _text(ctx, lab if n else "no data", 14 + ctx.text_extents("average: ").x_advance, y0 + 18, 11,
+              col, bold=True)
+        _text(ctx, f"PM10 {_fmt(pm10)}   PM2.5 {_fmt(pm25)}  µg/m³", W - 14, y0 + 18, 11, right=True)
     else:
         _text(ctx, "City mean", 14, y0, 12, bold=True)
         _text(ctx, "hover a station for details", W - 14, y0, 10.5, dim, right=True)
