@@ -10,8 +10,24 @@ Polish air quality index; hover a station for PM10 / PM2.5.
     python3 warsaw_smog.py --demo     # fake readings, no GIOŚ requests
     python3 warsaw_smog.py --snapshot out.png   # render one frame, no window
 
-Left-drag moves it. The button at the top right ("Whole city" with an arrow) opens the
-district list; right-click gives District / Refresh / Quit.
+Left-drag moves it. The button at the top right ("Whole city" with an arrow)
+opens the district list. Everything else is in the two rows under the map, and
+also in the right-click menu (which has Quit).
+
+## Refreshing
+
+- **Refresh** fetches everything now. It does nothing while a refresh is
+  already running.
+- The selector next to it ("every 30 min") sets the auto-refresh interval:
+  5, 10, 15, 30 or 60 minutes. The choice is remembered, and the new interval
+  counts from the moment you pick it.
+
+What a faster interval actually buys you differs per source:
+
+- Community sensors report every few minutes, so they do update at 5 minutes.
+- GIOŚ publishes one value per hour; asking more often returns the same data.
+- Airly readings are reused for 3 hours whatever the interval (and whatever
+  the Refresh button), because of the 100-requests-a-day limit; see below.
 
 ## Districts
 

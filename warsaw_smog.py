@@ -39,7 +39,7 @@ from pathlib import Path
 CITY = "Warszawa"                 # matched against "Nazwa miasta"
 MAP_CENTER = (52.232, 21.045)     # lat, lon
 MAP_ZOOM = 10                     # z10 fits the whole city in ~320 px
-WIDTH, HEIGHT = 360, 518
+WIDTH, HEIGHT = 360, 546
 
 # District views: approximate centre (lat, lon) and zoom. These are hand-placed
 # centre points, not official boundaries - adjust to taste. z12 shows roughly
@@ -64,7 +64,8 @@ DISTRICTS = {
     "Wola":           (52.237, 20.960, 12),
     "Żoliborz":       (52.270, 20.985, 12),
 }
-REFRESH_MINUTES = 30              # GIOŚ publishes hourly values
+REFRESH_MINUTES = 30              # default; GIOŚ publishes hourly values
+REFRESH_CHOICES = (5, 10, 15, 30, 60)   # offered in the widget, remembered between runs
 METADATA_TTL = 7 * 24 * 3600      # station / sensor lists rarely change
 
 API = "https://api.gios.gov.pl/pjp-api/v1/rest"
@@ -99,7 +100,7 @@ AIRLY_RADIUS_KM = 20              # installation list radius around MAP_CENTER
 # the last 5 minutes, so there is no per-sensor budget to manage.
 SC_URL = "https://data.sensor.community/airrohr/v1/filter/area={lat},{lon},{km}"
 SC_RADIUS_KM = 20
-SC_MAX_AGE = 10 * 60              # reuse the area snapshot for this long
+SC_MAX_AGE = 4 * 60               # reuse the area snapshot for this long (< shortest refresh)
 
 # Community sensors come without an address, so the street is looked up from
 # the coordinates with OSM's Nominatim. Its usage policy: at most 1 request per
@@ -727,13 +728,18 @@ class View:
     hits: list = field(default_factory=list)   # [(x, y, station)] from last draw
     chip: tuple = (0.0, 0.0, 0.0, 0.0)         # district selector rect from last draw
     chip_hover: bool = False
+    refresh_minutes: int = REFRESH_MINUTES
+    refreshing: bool = False
+    btn_refresh: tuple = (0.0, 0.0, 0.0, 0.0)  # "Refresh" button rect from last draw
+    rate_chip: tuple = (0.0, 0.0, 0.0, 0.0)    # auto-refresh selector rect from last draw
+    hot: str = ""                              # "refresh" / "rate" while the pointer is on one
     labels: bool = False                       # draw a name next to every marker
     toggle: tuple = (0.0, 0.0, 0.0, 0.0)       # "labels" checkbox rect from last draw
     tiles: dict = field(default_factory=dict)  # {(z, x, y): cairo surface}
 
 
 def map_rect() -> tuple[float, float, float, float]:
-    return 12.0, 62.0, WIDTH - 24.0, HEIGHT - 62.0 - 134.0
+    return 12.0, 62.0, WIDTH - 24.0, HEIGHT - 62.0 - 162.0
 
 
 def _rounded(ctx, x, y, w, h, r):
@@ -862,6 +868,35 @@ def scale_position(pm10: float | None, pm25: float | None, index: int | None = N
     return best
 
 
+def rate_label(minutes: int) -> str:
+    return "every hour" if minutes == 60 else f"every {minutes} min"
+
+
+def _chip(ctx, x: float, y: float, label: str, hot: bool, arrow: bool = False) -> tuple:
+    """Draw a small pill button; returns its (x, y, w, h) for hit-testing."""
+    import cairo
+    ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+    ctx.set_font_size(10)
+    w = ctx.text_extents(label).x_advance + 18 + (12 if arrow else 0)
+    rect = (x, y, w, 20.0)
+    _rounded(ctx, *rect, 10)
+    ctx.set_source_rgba(1, 1, 1, 0.20 if hot else 0.10)
+    ctx.fill_preserve()
+    ctx.set_line_width(1)
+    ctx.set_source_rgba(1, 1, 1, 0.35)
+    ctx.stroke()
+    _text(ctx, label, x + 9, y + 13.5, 10)
+    if arrow:
+        ax = x + w - 12
+        ctx.move_to(ax - 3.5, y + 8)
+        ctx.line_to(ax + 3.5, y + 8)
+        ctx.line_to(ax, y + 12.5)
+        ctx.close_path()
+        ctx.set_source_rgb(0.92, 0.94, 0.96)
+        ctx.fill()
+    return rect
+
+
 def summarise(stations: list[Station]):
     """Average of a set of sensors: (index, mean PM10, mean PM2.5, last time, n).
 
@@ -985,11 +1020,20 @@ def render(ctx, view: View) -> None:
             _text(ctx, t, box[0] + 3, box[1] + 10, 8.5, (0.88, 0.90, 0.93))
     ctx.restore()
 
-    # control row under the map (nothing is drawn over the map itself):
-    # the "labels" checkbox on the left, source status on the right
+    # Two control rows under the map (nothing is drawn over the map itself).
+    # Row 1: what the marker shapes mean, and the "labels" checkbox.
     ry = my + mh + 6
-    view.toggle = (10, ry - 1, 56, 18)                # click target, a little generous
-    bx, by = 14, ry + 3
+    shown = ["GIOŚ"] + [src for src, lst in (("Airly", view.airly), ("Community", view.community))
+                         if view.district and lst]
+    kx = 14.0
+    for src in shown:
+        _marker(ctx, src, kx + 4, ry + 8.5, 4.0)
+        ctx.set_source_rgb(*dim)
+        ctx.fill()
+        _text(ctx, src.lower() if src == "Community" else src, kx + 12, ry + 12, 9, dim)
+        kx += 28 + ctx.text_extents(src).x_advance
+    bx, by = W - 14 - 44, ry + 3
+    view.toggle = (bx - 4, ry - 1, 52, 18)            # click target, a little generous
     ctx.rectangle(bx + 0.5, by + 0.5, 9, 9)
     ctx.set_line_width(1)
     ctx.set_source_rgba(1, 1, 1, 0.75)
@@ -1002,17 +1046,25 @@ def render(ctx, view: View) -> None:
         ctx.set_source_rgb(0.92, 0.94, 0.96)
         ctx.stroke()
     _text(ctx, "labels", bx + 15, by + 8.5, 9, (0.80, 0.83, 0.87))
-    extra = " · ".join(t for t in (view.airly_status, view.community_status, view.street_status) if t)
-    if view.district and extra:
-        ctx.set_font_size(9)
-        avail = W - 14 - 74                           # right of the checkbox
-        while len(extra) > 4 and ctx.text_extents(extra).x_advance > avail:
-            extra = extra[:-2].rstrip() + "…"
-        _text(ctx, extra, W - 14, by + 8.5, 9, dim, right=True)
+
+    # Row 2: refresh now, auto-refresh rate, and when the data was last fetched.
+    r2 = ry + 23
+    view.btn_refresh = _chip(ctx, 14, r2, "Refresh", view.hot == "refresh")
+    view.rate_chip = _chip(ctx, 14 + view.btn_refresh[2] + 6, r2, rate_label(view.refresh_minutes),
+                           view.hot == "rate", arrow=True)
+    if view.refreshing:
+        when = "refreshing…"
+    elif view.updated:
+        times = sorted(s.index_time for s in view.stations if s.index_time)
+        when = (f"data {times[-1][11:16]} · " if times else "") \
+            + "checked " + time.strftime("%H:%M", time.localtime(view.updated))
+    else:
+        when = ""
+    _text(ctx, when, W - 14, r2 + 13.5, 9, dim, right=True)
 
     # detail line: hovered station; else the average of the district view;
     # else (whole city) the city mean
-    y0 = my + mh + 42
+    y0 = my + mh + 70
     sel = next((s for s in visible if s.uid == view.hover), None)
     note = ""
     if sel is not None:
@@ -1066,28 +1118,12 @@ def render(ctx, view: View) -> None:
         ctx.stroke()
     _text(ctx, "very good", 14, ly + 16, 9, dim)
     _text(ctx, "very bad", W - 14, ly + 16, 9, dim, right=True)
-    # marker key + attribution, only for the sources actually on screen
-    shown = ["GIOŚ"] + [src for src, lst in (("Airly", view.airly), ("Community", view.community))
-                         if view.district and lst]
-    if len(shown) > 1:
-        kx = 100.0
-        for src in shown:
-            _marker(ctx, src, kx, ly + 12.5, 4.0)
-            ctx.set_source_rgb(*dim)
-            ctx.fill()
-            _text(ctx, src.lower() if src == "Community" else src, kx + 8, ly + 16, 9, dim)
-            kx += 16 + ctx.text_extents(src).x_advance
-
-    # footer: status + attribution (required by both GIOŚ and OSM terms)
+    # footer: source status or error, then attribution (required by the data terms)
+    extra = " · ".join(t for t in (view.airly_status, view.community_status, view.street_status) if t)
     if view.error:
-        status, col = view.error, (0.95, 0.55, 0.45)
-    elif view.updated:
-        times = sorted(s.index_time for s in view.stations if s.index_time)
-        data_t = f"data {times[-1][11:16]} · " if times else ""
-        status, col = data_t + "checked " + time.strftime("%H:%M", time.localtime(view.updated)), dim
-    else:
-        status, col = "", dim
-    _text(ctx, status, 14, H - 23, 9, col, maxw=W - 28)
+        _text(ctx, view.error, 14, H - 23, 9, (0.95, 0.55, 0.45), maxw=W - 28)
+    elif view.district and extra:
+        _text(ctx, extra, 14, H - 23, 9, dim, maxw=W - 28)
     credit = ", ".join("Sensor.Community" if src == "Community" else src for src in shown)
     _text(ctx, f"Data: {credit} · Map © OpenStreetMap", 14, H - 10, 9, dim, maxw=W - 28)
 
@@ -1126,6 +1162,9 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     community = Community()
     geocoder = Geocoder()
     view.labels = bool(saved.get("labels", False))
+    if saved.get("refresh_minutes") in REFRESH_CHOICES:
+        view.refresh_minutes = saved["refresh_minutes"]
+    timer = {"id": 0}
 
     def preload_streets(stations, d):
         """Start loading every street for district d now, in its own thread."""
@@ -1158,7 +1197,12 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
                     | Gdk.EventMask.LEAVE_NOTIFY_MASK)
     win.add(area)
 
-    def refresh():
+    def refresh(*_):
+        if view.refreshing:             # one at a time, however often the button is clicked
+            return True
+        view.refreshing = True
+        area.queue_draw()
+
         def work():
             err, stations, d = "", None, view.district
             try:
@@ -1177,7 +1221,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             com = community_view(community, d, demo, geocoder)
 
             def apply():
-                view.loading = False
+                view.loading = view.refreshing = False
                 view.error = err
                 if stations is not None and not err:
                     view.stations, view.updated = stations, time.time()
@@ -1197,14 +1241,49 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         hit = min(view.hits, key=lambda h: (h[0] - ev.x) ** 2 + (h[1] - ev.y) ** 2, default=None)
         hid = hit[2].uid if hit and (hit[0] - ev.x) ** 2 + (hit[1] - ev.y) ** 2 <= 14 ** 2 else None
         chip = in_chip(ev)
-        if hid != view.hover or chip != view.chip_hover:
-            view.hover, view.chip_hover = hid, chip
+        hot = "refresh" if inside(view.btn_refresh, ev) else "rate" if inside(view.rate_chip, ev) else ""
+        if hid != view.hover or chip != view.chip_hover or hot != view.hot:
+            view.hover, view.chip_hover, view.hot = hid, chip, hot
             area.queue_draw()
 
     def on_leave(_w, _ev):
-        if view.hover is not None or view.chip_hover:
-            view.hover, view.chip_hover = None, False
+        if view.hover is not None or view.chip_hover or view.hot:
+            view.hover, view.chip_hover, view.hot = None, False, ""
             area.queue_draw()
+
+    def inside(rect, ev):
+        x, y, w, h = rect
+        return x <= ev.x <= x + w and y <= ev.y <= y + h
+
+    def arm_timer():
+        if timer["id"]:
+            GLib.source_remove(timer["id"])
+        timer["id"] = GLib.timeout_add_seconds(view.refresh_minutes * 60, refresh)
+
+    def set_rate(minutes):
+        if minutes != view.refresh_minutes:
+            view.refresh_minutes = minutes
+            save_state()
+            arm_timer()                 # the new interval counts from now
+            area.queue_draw()
+
+    def rate_menu():
+        sub = Gtk.Menu()
+        for m in REFRESH_CHOICES:
+            item = Gtk.CheckMenuItem(label=rate_label(m))
+            item.set_draw_as_radio(True)
+            item.set_active(m == view.refresh_minutes)
+            item.connect("activate", lambda _i, m=m: set_rate(m))
+            sub.append(item)
+        return sub
+
+    def popup_below(menu, rect_xywh, ev):
+        menu.attach_to_widget(area)
+        win.menu = menu     # keep a reference while it is open
+        menu.show_all()
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = (int(v) for v in rect_xywh)
+        menu.popup_at_rect(area.get_window(), rect, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, ev)
 
     def set_district(name):
         if name == view.district:
@@ -1267,6 +1346,10 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     def on_press(_w, ev):
         if ev.button == 1 and in_toggle(ev):
             toggle_labels()
+        elif ev.button == 1 and inside(view.btn_refresh, ev):
+            refresh()
+        elif ev.button == 1 and inside(view.rate_chip, ev):
+            popup_below(rate_menu(), view.rate_chip, ev)
         elif ev.button == 1 and in_chip(ev):
             menu = district_menu()
             menu.attach_to_widget(area)
@@ -1289,7 +1372,10 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             lab.set_active(view.labels)
             lab.connect("activate", toggle_labels)
             menu.append(lab)
-            for text, cb in (("Refresh now", lambda *_: refresh()),
+            rate = Gtk.MenuItem(label="Auto-refresh")
+            rate.set_submenu(rate_menu())
+            menu.append(rate)
+            for text, cb in (("Refresh now", refresh),
                              ("Open Airly map", lambda *_: Gtk.show_uri_on_window(
                                  win, "https://airly.org/map/en/", Gdk.CURRENT_TIME)),
                              ("Quit", quit_app)):
@@ -1303,7 +1389,8 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     def save_state():
         try:
             STATE_FILE.write_text(json.dumps(
-                {"pos": list(win.get_position()), "district": view.district, "labels": view.labels}, ensure_ascii=False))
+                {"pos": list(win.get_position()), "district": view.district, "labels": view.labels,
+                 "refresh_minutes": view.refresh_minutes}, ensure_ascii=False))
         except OSError:
             pass
 
@@ -1326,7 +1413,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
 
     win.show_all()
     refresh()
-    GLib.timeout_add_seconds(REFRESH_MINUTES * 60, refresh)
+    arm_timer()
     Gtk.main()
 
 
