@@ -12,6 +12,7 @@ sensors, coloured by the Polish air quality index.
 - Hover a marker for its PM10 / PM2.5 readings; otherwise the district average.
 - Optional street labels next to every marker.
 - Auto-refresh every 5 to 60 minutes, plus a Refresh button.
+- Minimum, average and maximum readings for the current session, with a trend line.
 
 ## Install and run
 
@@ -34,6 +35,10 @@ Other ways to start it:
   nothing hovered, a district view shows the average of all sensors in view
   and the time of the latest measurement.
 - **Colour scale:** the white dot marks the hovered sensor, or the average.
+- **This run:** under the scale you see the lowest, average and highest PM10
+  and PM2.5 since the widget was started, with a small trend line, for the
+  hovered sensor or else the district average. The history is kept only while
+  the widget runs. A district's history grows while that district is open.
 - **Labels:** tick "labels" under the map to show a name next to every marker.
 - **Refresh:** the "Refresh" button fetches new data now; the selector next to
   it sets how often this happens automatically.

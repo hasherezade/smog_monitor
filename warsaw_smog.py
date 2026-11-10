@@ -39,7 +39,7 @@ from pathlib import Path
 CITY = "Warszawa"                 # matched against "Nazwa miasta"
 MAP_CENTER = (52.232, 21.045)     # lat, lon
 MAP_ZOOM = 10                     # z10 fits the whole city in ~320 px
-WIDTH, HEIGHT = 360, 546
+WIDTH, HEIGHT = 360, 598
 
 # District views: approximate centre (lat, lon) and zoom. These are hand-placed
 # centre points, not official boundaries - adjust to taste. z12 shows roughly
@@ -65,6 +65,7 @@ DISTRICTS = {
     "Żoliborz":       (52.270, 20.985, 12),
 }
 REFRESH_MINUTES = 30              # default; GIOŚ publishes hourly values
+HISTORY_MAX = 2000                # readings kept per sensor / district for this run (memory only)
 REFRESH_CHOICES = (5, 10, 15, 30, 60)   # offered in the widget, remembered between runs
 METADATA_TTL = 7 * 24 * 3600      # station / sensor lists rarely change
 
@@ -735,11 +736,12 @@ class View:
     hot: str = ""                              # "refresh" / "rate" while the pointer is on one
     labels: bool = False                       # draw a name next to every marker
     toggle: tuple = (0.0, 0.0, 0.0, 0.0)       # "labels" checkbox rect from last draw
+    history: dict = field(default_factory=dict)    # key -> [(time, pm10, pm25, mark)], this run only
     tiles: dict = field(default_factory=dict)  # {(z, x, y): cairo surface}
 
 
 def map_rect() -> tuple[float, float, float, float]:
-    return 12.0, 62.0, WIDTH - 24.0, HEIGHT - 62.0 - 162.0
+    return 12.0, 62.0, WIDTH - 24.0, HEIGHT - 62.0 - 214.0
 
 
 def _rounded(ctx, x, y, w, h, r):
@@ -866,6 +868,45 @@ def scale_position(pm10: float | None, pm25: float | None, index: int | None = N
         if best is None or not (index <= best <= index + 1):
             return index + 0.5
     return best
+
+
+def record_history(view: "View", now: float | None = None) -> None:
+    """Add the current readings to this run's history (memory only, never saved).
+
+    One series per sensor on screen, one for the open district's average and
+    one for the city mean. A reading is added only when it differs from the
+    last one recorded, so re-fetching unchanged data does not skew the stats.
+    """
+    now = time.time() if now is None else now
+
+    def rec(key, pm10, pm25, mark):
+        if pm10 is None and pm25 is None:
+            return
+        series = view.history.setdefault(key, [])
+        if series and series[-1][3] == mark:
+            return
+        series.append((now, pm10, pm25, mark))
+        del series[:-HISTORY_MAX]
+
+    visible = view.stations + (view.community + view.airly if view.district else [])
+    for s in visible:
+        rec(s.uid, s.pm10, s.pm25, (s.index_time, s.pm10, s.pm25))
+    if view.district:
+        _, _, mw, mh = map_rect()
+        _, pm10, pm25, last, _ = summarise(
+            [s for s in visible if in_view(s.lat, s.lon, view.district, mw, mh)])
+        rec("district:" + view.district, pm10, pm25, (last, pm10, pm25))
+    pm10, pm25 = _mean(s.pm10 for s in view.stations), _mean(s.pm25 for s in view.stations)
+    rec("city", pm10, pm25, (max((s.index_time for s in view.stations), default=""), pm10, pm25))
+
+
+def history_stats(series: list) -> dict:
+    """{"n", "since", "pm10": (min, mean, max) | None, "pm25": ...} for one series."""
+    out = {"n": len(series), "since": series[0][0] if series else None}
+    for key, col in (("pm10", 1), ("pm25", 2)):
+        vals = [r[col] for r in series if r[col] is not None]
+        out[key] = (min(vals), sum(vals) / len(vals), max(vals)) if vals else None
+    return out
 
 
 def rate_label(minutes: int) -> str:
@@ -1074,6 +1115,7 @@ def render(ctx, view: View) -> None:
             + (f" · {sel.index_time[11:16]}" if sel.index_time else "")
     if sel:
         pointer = scale_position(sel.pm10, sel.pm25, sel.index)
+        hist_key = sel.uid
         name = sel.name.split(",", 1)[-1].strip() or sel.name
         lab, col = INDEX[sel.index] if sel.index is not None else NO_INDEX
         if note:
@@ -1086,6 +1128,7 @@ def render(ctx, view: View) -> None:
     elif view.district:
         idx, pm10, pm25, last, n = summarise([s for _, _, s in view.hits])
         pointer = scale_position(pm10, pm25)
+        hist_key = "district:" + view.district
         lab, col = INDEX[idx] if idx is not None else NO_INDEX
         _text(ctx, view.district, 14, y0, 12, bold=True)
         if n:
@@ -1102,6 +1145,7 @@ def render(ctx, view: View) -> None:
         _text(ctx, "hover a station for details", W - 14, y0, 10.5, dim, right=True)
         pm10, pm25 = _mean(s.pm10 for s in view.stations), _mean(s.pm25 for s in view.stations)
         pointer = scale_position(pm10, pm25)
+        hist_key = "city"
         _text(ctx, f"PM10 {_fmt(pm10)}   PM2.5 {_fmt(pm25)}  µg/m³", 14, y0 + 18, 11)
 
     # legend
@@ -1120,6 +1164,50 @@ def render(ctx, view: View) -> None:
         ctx.stroke()
     _text(ctx, "very good", 14, ly + 16, 9, dim)
     _text(ctx, "very bad", W - 14, ly + 16, 9, dim, right=True)
+
+    # stats for this run, for the same thing the lines above describe
+    sy = ly + 26
+    series = view.history.get(hist_key, [])
+    st = history_stats(series)
+    if st["n"]:
+        head = (f"this run · since {time.strftime('%H:%M', time.localtime(st['since']))}"
+                f" · {st['n']} reading{'s' * (st['n'] != 1)}")
+    else:
+        head = "this run · no readings yet"
+    _text(ctx, head, 14, sy + 9, 9, dim)
+    for row, (key, name) in enumerate((("pm10", "PM10"), ("pm25", "PM2.5"))):
+        yy = sy + 25 + row * 15
+        _text(ctx, name, 14, yy, 10, dim)
+        if st[key]:
+            lo, avg, hi = st[key]
+            x = 52.0
+            for tag, v in (("min", lo), ("avg", avg), ("max", hi)):
+                _text(ctx, tag, x, yy, 9, dim)
+                _text(ctx, _fmt(v), x + 21, yy, 10.5)
+                x += 58
+        else:
+            _text(ctx, "–", 52, yy, 10.5, dim)
+    # sparkline of the worse pollutant's place on the scale, coloured by category
+    pts = [(t, scale_position(a, b)) for t, a, b, _ in series]
+    pts = [(t, v) for t, v in pts if v is not None]
+    gx, gy, gw, gh = W - 14 - 104.0, sy + 15.0, 104.0, 26.0
+    if pts:
+        t0, t1 = pts[0][0], pts[-1][0]
+        lo, hi = min(v for _, v in pts), max(v for _, v in pts)
+        pad = max(0.0, 1.0 - (hi - lo)) / 2          # show at least one category of range
+        lo, hi = lo - pad, hi + pad
+        xy = [(gx + (gw * (t - t0) / (t1 - t0) if t1 > t0 else gw), gy + gh * (1 - (v - lo) / (hi - lo)), v)
+              for t, v in pts]
+        ctx.set_line_width(1.6)
+        for (xa, ya, _), (xb, yb, vb) in zip(xy, xy[1:]):
+            ctx.move_to(xa, ya)
+            ctx.line_to(xb, yb)
+            ctx.set_source_rgb(*INDEX[min(int(vb), len(INDEX) - 1)][1])
+            ctx.stroke()
+        xl, yl, vl = xy[-1]
+        ctx.arc(xl, yl, 2.6, 0, 2 * math.pi)
+        ctx.set_source_rgb(*INDEX[min(int(vl), len(INDEX) - 1)][1])
+        ctx.fill()
     # footer: source status or error, then attribution (required by the data terms)
     extra = " · ".join(t for t in (view.airly_status, view.community_status, view.street_status) if t)
     if view.error:
@@ -1230,6 +1318,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
                 if view.district == d:              # user may have switched meanwhile
                     view.airly, view.airly_status = air
                     view.community, view.community_status = com
+                record_history(view)
                 load_tile_surfaces(view)
                 area.queue_draw()
             GLib.idle_add(apply)
@@ -1316,6 +1405,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             def apply():
                 if view.district == name:
                     view.airly, view.airly_status = air
+                    record_history(view)        # all sources for this district are in now
                     area.queue_draw()
             GLib.idle_add(apply)
         threading.Thread(target=work, daemon=True).start()
@@ -1438,6 +1528,7 @@ def snapshot(path: str, demo: bool, district: str | None = None, labels: bool = 
     view.community, view.community_status = community_view(Community(), view.district, demo, geocoder)
     if not demo:
         geocoder.resolve(view.community)
+    record_history(view)
     load_tile_surfaces(view)
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, WIDTH * 2, HEIGHT * 2)
     ctx = cairo.Context(surf)
