@@ -50,7 +50,7 @@ Your district, label and refresh settings are remembered.
 ## History file
 
 Readings are also saved as CSV, one file per month, in
-`~/.local/share/warsaw-smog/` (for example `history-2026-11.csv`), so you can
+`~/.local/share/warsaw-smog/data/` (for example `history-2026-11.csv`), so you can
 compare days and hours later in a spreadsheet or with a script. Right-click the
 widget to switch saving off ("Save history to CSV") or to open the folder.
 
@@ -138,7 +138,7 @@ The widget contacts only these services, and sends no personal data:
 
 It uses no third-party Python packages. Downloaded map tiles and street names
 are kept in `~/.cache/warsaw-smog/`, settings in `~/.config/warsaw-smog.json`,
-history in `~/.local/share/warsaw-smog/`.
+history in `~/.local/share/warsaw-smog/data/`.
 
 ## Known limitations
 

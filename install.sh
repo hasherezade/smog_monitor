@@ -19,7 +19,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f "$AUTOSTART" "$LAUNCHER" "$APP"
     rmdir "$APP_DIR" 2>/dev/null || true
     echo "Removed the widget, its autostart entry and its menu entry."
-    echo "Kept: settings ($CONF/warsaw-smog.json), history ($DATA/warsaw-smog/),"
+    echo "Kept: settings ($CONF/warsaw-smog.json), history ($DATA/warsaw-smog/data/),"
     echo "      cache (${XDG_CACHE_HOME:-$HOME/.cache}/warsaw-smog/). Delete them by hand if you wish."
     echo "If the widget is running now, close it with right-click > Quit."
     exit 0
