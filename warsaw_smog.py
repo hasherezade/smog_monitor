@@ -1056,7 +1056,9 @@ def render(ctx, view: View) -> None:
         when = "refreshing…"
     elif view.updated:
         times = sorted(s.index_time for s in view.stations if s.index_time)
-        when = (f"data {times[-1][11:16]} · " if times else "") \
+        # the GIOŚ time is the hour its newest published value belongs to; the
+        # other sources have their own, newer, times (shown in the detail line)
+        when = (f"GIOŚ {times[-1][11:16]} · " if times else "") \
             + "checked " + time.strftime("%H:%M", time.localtime(view.updated))
     else:
         when = ""
