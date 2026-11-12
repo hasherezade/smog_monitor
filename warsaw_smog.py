@@ -18,6 +18,7 @@ Layout of this file:
   3. map tiles       - Web Mercator maths + on-disk tile cache
   4. renderer        - draws onto any cairo context (also used by --snapshot)
   5. GTK shell       - window, input, refresh timer
+  6. district outlines - boundary data for "which district is this?"
 """
 from __future__ import annotations
 
@@ -41,6 +42,14 @@ CITY = "Warszawa"                 # matched against "Nazwa miasta"
 MAP_CENTER = (52.232, 21.045)     # lat, lon
 MAP_ZOOM = 10                     # z10 fits the whole city in ~320 px
 WIDTH, HEIGHT = 360, 598
+
+# Map navigation: drag the map to move it, scroll over it to zoom.
+ZOOM_MIN, ZOOM_MAX = 10, 15       # OSM tile levels; 10 shows the whole city
+DISTRICT_ZOOM = 11                # from this zoom in, the map counts as a district view
+PAN_BOUNDS = (52.07, 20.80, 52.40, 21.32)   # the map centre stays in this lat/lon box: Warsaw plus a margin
+TILE_MEMORY = 120                 # map tiles kept in memory at once (each about 0.25 MB)
+STREETS_PER_VIEW = 60             # street lookups started per view, nearest the map centre first
+AIRLY_SETTLE_MS = 2000            # Airly is asked only once the map has rested this long on a district
 
 # District views: approximate centre (lat, lon) and zoom. These are hand-placed
 # centre points, not official boundaries - adjust to taste. z12 shows roughly
@@ -625,6 +634,19 @@ def community_view(client: "Community | None", district: str, demo: bool,
     return shown, f"Community: {len(shown)}"
 
 
+def all_community_sensors(client: "Community | None", district: str, demo: bool,
+                          geocoder: "Geocoder | None" = None) -> list[Station]:
+    """Every outdoor community sensor in the city, for drawing wherever the map
+    is moved to (community_view gives just the open district's). Never raises."""
+    try:
+        sensors = (demo_community(district) if district else []) if demo else client.all()
+    except Exception:
+        return []
+    if geocoder and not demo:
+        geocoder.apply(sensors)     # streets already known
+    return sensors
+
+
 def demo_community(district: str) -> list[Station]:
     """Fake sensors scattered round a district centre. Not real locations."""
     clat, clon, _ = viewport(district)
@@ -690,9 +712,106 @@ def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 6371.0 * math.hypot(dx, dy)
 
 
-def tiles_for_view(w: float, h: float, district: str = "") -> list[tuple[int, int, int]]:
-    """(z, x, y) of every tile intersecting a w x h px view of the district."""
-    lat, lon, z = viewport(district)
+def unproject(x: float, y: float, zoom: int) -> tuple[float, float]:
+    """Global Web Mercator pixel coordinates -> (lat, lon). Inverse of mercator_px."""
+    n = 256.0 * (1 << zoom)
+    return math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / n)))), x / n * 360.0 - 180.0
+
+
+def clamp_view(lat: float, lon: float, zoom: int) -> tuple[float, float, int]:
+    """Keep a map view inside the allowed zoom range and the box round Warsaw."""
+    return (min(max(lat, PAN_BOUNDS[0]), PAN_BOUNDS[2]), min(max(lon, PAN_BOUNDS[1]), PAN_BOUNDS[3]),
+            min(max(int(zoom), ZOOM_MIN), ZOOM_MAX))
+
+
+def pan_by(center: tuple, zoom: int, dx: float, dy: float) -> tuple[float, float]:
+    """New map centre after the map is dragged by (dx, dy) pixels."""
+    cx, cy = mercator_px(*center, zoom)
+    return unproject(cx - dx, cy - dy, zoom)
+
+
+def zoom_about(center: tuple, zoom: int, new_zoom: int, dx: float, dy: float) -> tuple[float, float]:
+    """New map centre when zooming so that the point (dx, dy) pixels from the
+    middle of the map stays where it is."""
+    cx, cy = mercator_px(*center, zoom)
+    px, py = mercator_px(*unproject(cx + dx, cy + dy, zoom), new_zoom)
+    return unproject(px - dx, py - dy, new_zoom)
+
+
+def in_viewport(lat: float, lon: float, center: tuple, zoom: int, w: float, h: float) -> bool:
+    """Is the point inside a w x h px map centred on `center` at `zoom`?"""
+    cx, cy = mercator_px(*center, zoom)
+    px, py = mercator_px(lat, lon, zoom)
+    return abs(px - cx) <= w / 2 and abs(py - cy) <= h / 2
+
+
+_SHAPES: dict = {}
+SHAPE_SLACK_KM = 0.1      # the outlines are simplified to ~40 m, so allow for thin gaps between neighbours
+
+
+def district_shapes() -> dict:
+    """{name: ((lon0, lat0, lon1, lat1), [(lon, lat), ...])}, decoded once from DISTRICT_SHAPES."""
+    if not _SHAPES:
+        for name, text in DISTRICT_SHAPES.items():
+            ring = [(20 + int(a) / 1e4, 52 + int(b) / 1e4) for a, b in (pt.split(",") for pt in text.split())]
+            xs, ys = [pt[0] for pt in ring], [pt[1] for pt in ring]
+            _SHAPES[name] = ((min(xs), min(ys), max(xs), max(ys)), ring)
+    return _SHAPES
+
+
+def _in_ring(lon: float, lat: float, ring: list) -> bool:
+    """Ray-casting point-in-polygon test."""
+    inside, j = False, len(ring) - 1
+    for i in range(len(ring)):
+        (xi, yi), (xj, yj) = ring[i], ring[j]
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _edge_km(lat: float, lon: float, ring: list) -> float:
+    """Distance from a point to the nearest edge of a polygon."""
+    kx, ky = 111.32 * math.cos(math.radians(lat)), 110.57      # km per degree here
+    best = float("inf")
+    for i in range(len(ring)):
+        ax, ay = (ring[i - 1][0] - lon) * kx, (ring[i - 1][1] - lat) * ky
+        bx, by = (ring[i][0] - lon) * kx, (ring[i][1] - lat) * ky
+        dx, dy = bx - ax, by - ay
+        t = 0.0 if dx == dy == 0 else min(1.0, max(0.0, -(ax * dx + ay * dy) / (dx * dx + dy * dy)))
+        best = min(best, math.hypot(ax + t * dx, ay + t * dy))
+    return best
+
+
+def district_at(lat: float, lon: float) -> str:
+    """Name of the district the point is in, or "" if it is outside Warsaw."""
+    shapes = district_shapes()
+    for name, (b, ring) in shapes.items():
+        if b[0] <= lon <= b[2] and b[1] <= lat <= b[3] and _in_ring(lon, lat, ring):
+            return name
+    best, best_d = "", SHAPE_SLACK_KM       # in no outline: on a seam between two, or outside
+    for name, (b, ring) in shapes.items():
+        if b[0] - 0.003 <= lon <= b[2] + 0.003 and b[1] - 0.002 <= lat <= b[3] + 0.002:
+            d = _edge_km(lat, lon, ring)
+            if d < best_d:
+                best, best_d = name, d
+    return best
+
+
+def locate(lat: float, lon: float, zoom: int) -> tuple[str, bool]:
+    """(district, outside) for a map view: which district its centre is in.
+
+    Zoomed out to the whole city there is no district: ("", False). Zoomed in
+    over Warsaw: (name, False). Zoomed in beyond the city boundary: ("", True).
+    """
+    if zoom < DISTRICT_ZOOM:
+        return "", False
+    name = district_at(lat, lon)
+    return name, not name
+
+
+def tiles_for_view(w: float, h: float, lat: float, lon: float, z: int) -> list[tuple[int, int, int]]:
+    """(z, x, y) of every tile intersecting a w x h px map centred on (lat, lon)."""
     cx, cy = mercator_px(lat, lon, z)
     x0, x1 = int((cx - w / 2) // 256), int((cx + w / 2) // 256)
     y0, y1 = int((cy - h / 2) // 256), int((cy + h / 2) // 256)
@@ -703,9 +822,9 @@ def tile_path(z: int, x: int, y: int) -> Path:
     return CACHE_DIR / "tiles" / str(z) / str(x) / f"{y}.png"
 
 
-def ensure_tiles(w: float, h: float, district: str = "") -> None:
+def ensure_tiles(w: float, h: float, lat: float, lon: float, zoom: int) -> None:
     """Download missing tiles once; they are kept on disk indefinitely."""
-    for z, x, y in tiles_for_view(w, h, district):
+    for z, x, y in tiles_for_view(w, h, lat, lon, zoom):
         p = tile_path(z, x, y)
         if p.exists():
             continue
@@ -737,7 +856,14 @@ class View:
     community_status: str = ""
     street_status: str = ""           # progress of the street preload
     demo: bool = False
-    district: str = ""                # "" = whole city, else a key of DISTRICTS
+    district: str = ""                # a key of DISTRICTS; "" = whole city, or outside Warsaw
+    outside: bool = False             # zoomed in, but the middle of the map is outside Warsaw
+    center: tuple | None = None       # (lat, lon) in the middle of the map; None = the district's standard view
+    zoom: int | None = None
+    dragging: bool = False            # the map is being dragged right now
+    gen: int = 0                      # goes up with every map move, so background work for an old view can stop
+    community_all: list = field(default_factory=list)    # city-wide community sensors, for drawing
+    airly_for: str | None = None      # the district view.airly was fetched for
     hits: list = field(default_factory=list)   # [(x, y, station)] from last draw
     chip: tuple = (0.0, 0.0, 0.0, 0.0)         # district selector rect from last draw
     chip_hover: bool = False
@@ -753,6 +879,35 @@ class View:
     log: "HistoryLog | None" = None                # CSV log; None = not saving (demo, snapshot)
     history: dict = field(default_factory=dict)    # key -> [(time, pm10, pm25, mark)]: today + this run
     tiles: dict = field(default_factory=dict)  # {(z, x, y): cairo surface}
+
+    def __post_init__(self):
+        lat, lon, zoom = viewport(self.district)
+        if self.center is None:
+            self.center = (lat, lon)
+        if self.zoom is None:
+            self.zoom = zoom
+
+
+def district_sensors(view: "View") -> list[Station]:
+    """The sensors behind the open district's figures: everything inside the
+    district's standard map rectangle, wherever the map itself has been moved."""
+    if not view.district:
+        return []
+    _, _, mw, mh = map_rect()
+    return [s for s in view.stations + view.community + view.airly
+            if in_view(s.lat, s.lon, view.district, mw, mh)]
+
+
+def drawn_sensors(view: "View") -> list[Station]:
+    """Low-cost sensors to draw (zoomed-in views only): community sensors from
+    the whole city, so they show wherever the map is, plus the open district's
+    Airly sensors."""
+    if view.zoom < DISTRICT_ZOOM:
+        return []
+    seen: dict = {}
+    for s in view.community_all + view.community + view.airly:
+        seen.setdefault(s.uid, s)
+    return list(seen.values())
 
 
 def map_rect() -> tuple[float, float, float, float]:
@@ -1034,7 +1189,7 @@ def record_history(view: "View", now: float | None = None) -> None:
     now = time.time() if now is None else now
     rows = []
 
-    def rec(key, pm10, pm25, measured, **row):
+    def rec(key, pm10, pm25, measured, save=True, **row):
         if pm10 is None and pm25 is None:
             return
         measured = _iso(measured)
@@ -1044,6 +1199,8 @@ def record_history(view: "View", now: float | None = None) -> None:
             return
         series.append((now, pm10, pm25, mark))
         del series[:-HISTORY_MAX]
+        if not save:
+            return
         cat = row.pop("category", None)
         if cat is None:
             cat = pl_index(pm10, pm25)
@@ -1061,11 +1218,17 @@ def record_history(view: "View", now: float | None = None) -> None:
         rec(s.uid, s.pm10, s.pm25, s.index_time,
             kind="sensor", source=s.source, id=s.id, name=" ".join(name.split()),
             lat=s.lat, lon=s.lon, category=s.index, sensors="")
-    if view.district:
+    # Sensors that are only on screen because the map was moved or zoomed out
+    # beyond the district's standard view: stats while the widget runs, not saved.
+    if view.zoom >= DISTRICT_ZOOM:
         _, _, mw, mh = map_rect()
+        known = {s.uid for s in visible}
+        for s in view.community_all:
+            if s.uid not in known and in_viewport(s.lat, s.lon, view.center, view.zoom, mw, mh):
+                rec(s.uid, s.pm10, s.pm25, s.index_time, save=False)
+    if view.district:
         clat, clon, _ = viewport(view.district)
-        _, pm10, pm25, last, n = summarise(
-            [s for s in visible if in_view(s.lat, s.lon, view.district, mw, mh)])
+        _, pm10, pm25, last, n = summarise(district_sensors(view))
         rec("district:" + view.district, pm10, pm25, last,
             kind="district", source="average", id="", name=view.district,
             lat=clat, lon=clon, sensors=n)
@@ -1168,7 +1331,7 @@ def render(ctx, view: View) -> None:
     ctx.set_source_rgb(*colour)
     ctx.fill()
     # district selector: a clickable "chip" at the top right (left-click opens the list)
-    chip_label = view.district or "Whole city"
+    chip_label = view.district or ("Outside Warsaw" if view.outside else "Whole city")
     ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
     ctx.set_font_size(11)
     cw = ctx.text_extents(chip_label).x_advance + 36
@@ -1204,8 +1367,8 @@ def render(ctx, view: View) -> None:
     ctx.clip()
     ctx.set_source_rgb(0.12, 0.15, 0.18)
     ctx.paint()
-    clat, clon, zoom = viewport(view.district)
-    cx, cy = mercator_px(clat, clon, zoom)
+    zoom = view.zoom
+    cx, cy = mercator_px(*view.center, zoom)
     ox, oy = mx + mw / 2 - cx, my + mh / 2 - cy       # global px -> widget px
     for (tz, tx, ty), surf in view.tiles.items():
         if tz != zoom:
@@ -1213,7 +1376,7 @@ def render(ctx, view: View) -> None:
         ctx.set_source_surface(surf, round(ox + tx * 256), round(oy + ty * 256))
         ctx.paint_with_alpha(0.55)                    # dim the basemap so dots carry
     view.hits = []
-    visible = view.stations + (view.community + view.airly if view.district else [])
+    visible = view.stations + drawn_sensors(view)
     # reference stations on top of low-cost sensors; within each source, worst last
     for s in sorted(visible, key=lambda s: (SOURCE_RANK[s.source], -1 if s.index is None else s.index)):
         px, py = mercator_px(s.lat, s.lon, zoom)
@@ -1230,7 +1393,8 @@ def render(ctx, view: View) -> None:
         ctx.set_source_rgba(1, 1, 1, 0.95 if hovered else 0.75)
         ctx.stroke()
     # always-on labels (the "labels" checkbox): every marker gets one
-    if view.labels:
+    # (left out while the map is being dragged, to keep the dragging smooth)
+    if view.labels and not view.dragging:
         ctx.select_font_face("Ubuntu", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
         ctx.set_font_size(8.5)
         items = []
@@ -1251,8 +1415,8 @@ def render(ctx, view: View) -> None:
     # Two control rows under the map (nothing is drawn over the map itself).
     # Row 1: what the marker shapes mean, and the "labels" checkbox.
     ry = my + mh + 6
-    shown = ["GIOŚ"] + [src for src, lst in (("Airly", view.airly), ("Community", view.community))
-                         if view.district and lst]
+    used = {s.source for _, _, s in view.hits} | {s.source for s in district_sensors(view)}
+    shown = ["GIOŚ"] + [src for src in ("Airly", "Community") if src in used]
     kx = 14.0
     for src in shown:
         _marker(ctx, src, kx + 4, ry + 8.5, 4.0)
@@ -1292,8 +1456,8 @@ def render(ctx, view: View) -> None:
         when = ""
     _text(ctx, when, W - 14, r2 + 13.5, 9, dim, right=True)
 
-    # detail line: hovered station; else the average of the district view;
-    # else (whole city) the city mean
+    # detail line: hovered station; else the average of the district in the
+    # middle of the map; else "outside"; else (whole city) the city mean
     y0 = my + mh + 70
     sel = next((s for s in visible if s.uid == view.hover), None)
     note = ""
@@ -1313,7 +1477,7 @@ def render(ctx, view: View) -> None:
         _text(ctx, lab, 14, y0 + 18, 11, col, bold=True)
         _text(ctx, f"PM10 {_fmt(sel.pm10)}   PM2.5 {_fmt(sel.pm25)}  µg/m³", W - 14, y0 + 18, 11, right=True)
     elif view.district:
-        idx, pm10, pm25, last, n = summarise([s for _, _, s in view.hits])
+        idx, pm10, pm25, last, n = summarise(district_sensors(view))
         pointer = scale_position(pm10, pm25)
         hist_key = "district:" + view.district
         lab, col = INDEX[idx] if idx is not None else NO_INDEX
@@ -1327,6 +1491,10 @@ def render(ctx, view: View) -> None:
         _text(ctx, lab if n else "no data", 14 + ctx.text_extents("average: ").x_advance, y0 + 18, 11,
               col, bold=True)
         _text(ctx, f"PM10 {_fmt(pm10)}   PM2.5 {_fmt(pm25)}  µg/m³", W - 14, y0 + 18, 11, right=True)
+    elif view.outside:
+        pointer, hist_key = None, ""
+        _text(ctx, "Outside the monitored area", 14, y0, 12, bold=True)
+        _text(ctx, "move the map back over Warsaw, or pick a district", 14, y0 + 18, 10.5, dim, maxw=W - 28)
     else:
         _text(ctx, "City mean", 14, y0, 12, bold=True)
         _text(ctx, "hover a station for details", W - 14, y0, 10.5, dim, right=True)
@@ -1362,7 +1530,7 @@ def render(ctx, view: View) -> None:
         fmt = "%H:%M" if first[:3] == time.localtime()[:3] else "%d %b %H:%M"
         head = f"history · since {time.strftime(fmt, first)} · {st['n']} reading{'s' * (st['n'] != 1)}"
     else:
-        head = "history · no readings yet"
+        head = "history · none outside Warsaw" if hist_key == "" else "history · no readings yet"
     if view.gap_hover:              # pointer is on a dashed part of the trend line
         _text(ctx, gap_text(*view.gap_hover), 14, sy + 9, 9, (0.92, 0.94, 0.96), maxw=W - 28)
     else:
@@ -1421,16 +1589,21 @@ def render(ctx, view: View) -> None:
     problem = view.error or (view.log.error if view.log else "")
     if problem:
         _text(ctx, problem, 14, H - 23, 9, (0.95, 0.55, 0.45), maxw=W - 28)
-    elif view.district and extra:
+    elif extra and view.zoom >= DISTRICT_ZOOM:
         _text(ctx, extra, 14, H - 23, 9, dim, maxw=W - 28)
     credit = ", ".join("Sensor.Community" if src == "Community" else src for src in shown)
     _text(ctx, f"Data: {credit} · Map © OpenStreetMap", 14, H - 10, 9, dim, maxw=W - 28)
 
 
 def load_tile_surfaces(view: View) -> None:
+    """Read the tiles the current map view needs from disk into memory."""
     import cairo
     _, _, mw, mh = map_rect()
-    for xy in tiles_for_view(mw, mh, view.district):
+    needed = tiles_for_view(mw, mh, *view.center, view.zoom)
+    if len(view.tiles) > TILE_MEMORY:       # forget tiles from places looked at earlier
+        for xy in [xy for xy in view.tiles if xy not in needed][:len(view.tiles) - TILE_MEMORY // 2]:
+            del view.tiles[xy]
+    for xy in needed:
         if xy in view.tiles:
             continue
         p = tile_path(*xy)
@@ -1453,9 +1626,16 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         saved = json.loads(STATE_FILE.read_text())
     except Exception:
         saved = {}
-    if district is None:
-        district = saved.get("district", "")
-    view = View(demo=demo, district=district if district in DISTRICTS else "")
+    start = None
+    if district is None:                # no --district: carry on where the map was left
+        try:
+            start = clamp_view(float(saved["center"][0]), float(saved["center"][1]), int(saved["zoom"]))
+        except Exception:
+            district = saved.get("district", "")
+    if start is None:
+        start = viewport(district if district in DISTRICTS else "")
+    name, outside = locate(*start)
+    view = View(demo=demo, district=name, outside=outside, center=start[:2], zoom=start[2])
     key = airly_key()
     airly = Airly(key) if key else None
     community = Community()
@@ -1468,17 +1648,42 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     if saved.get("refresh_minutes") in REFRESH_CHOICES:
         view.refresh_minutes = saved["refresh_minutes"]
     timer = {"id": 0}
+    pending = {"id": 0}                 # timer that fires once the map has stopped moving
+    drag = {"on": False, "x": 0.0, "y": 0.0}
+    scroll = {"acc": 0.0}
 
-    def preload_streets(stations, d):
-        """Start loading every street for district d now, in its own thread."""
+    def preload_streets():
+        """Look up streets for the community sensors in view, in the background:
+        the open district's own first, then the others on the map, nearest its
+        middle first. Stops as soon as the map moves on."""
+        if demo:
+            return
+        _, _, mw, mh = map_rect()
+        (clat, clon), gen = view.center, view.gen
+        on_map = sorted((s for s in view.community_all
+                         if in_viewport(s.lat, s.lon, view.center, view.zoom, mw, mh)),
+                        key=lambda s: distance_km(clat, clon, s.lat, s.lon))
+        todo = list({s.uid: s for s in view.community + on_map}.values())[:STREETS_PER_VIEW]
+        if not todo:
+            return
+
         def progress(text):
             def ui():
-                if view.district == d:
+                if view.gen == gen:
                     view.street_status = text
                     area.queue_draw()
             GLib.idle_add(ui)
         threading.Thread(target=geocoder.resolve, daemon=True,
-                         args=(stations, progress, lambda: view.district == d)).start()
+                         args=(todo, progress, lambda: view.gen == gen)).start()
+
+    def sync_community():
+        """The open district's community sensors, from the city-wide list in memory."""
+        if not view.district:
+            view.community, view.community_status = [], ""
+            return
+        _, _, mw, mh = map_rect()
+        view.community = [s for s in view.community_all if in_view(s.lat, s.lon, view.district, mw, mh)]
+        view.community_status = f"Community: {len(view.community)}"
 
     win = Gtk.Window(title="Warsaw smog")
     win.set_default_size(WIDTH, HEIGHT)
@@ -1497,7 +1702,8 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
 
     area = Gtk.DrawingArea()
     area.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK
-                    | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+                    | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                    | Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
     win.add(area)
 
     def refresh(*_):
@@ -1506,11 +1712,13 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         view.refreshing = True
         area.queue_draw()
 
+        d, (lat, lon), zoom = view.district, view.center, view.zoom
+
         def work():
-            err, stations, d = "", None, view.district
+            err, stations = "", None
             try:
                 _, _, mw, mh = map_rect()
-                ensure_tiles(mw, mh, d)
+                ensure_tiles(mw, mh, lat, lon, zoom)
                 if demo:
                     stations = demo_stations()
                 else:
@@ -1522,26 +1730,40 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
                 err = f"{type(e).__name__}: {getattr(e, 'reason', e)}"
             air = airly_view(airly, d, demo)       # independent of GIOŚ succeeding
             com = community_view(community, d, demo, geocoder)
+            allc = all_community_sensors(community, d, demo, geocoder) if zoom >= DISTRICT_ZOOM else []
 
             def apply():
                 view.loading = view.refreshing = False
                 view.error = err
                 if stations is not None and not err:
                     view.stations, view.updated = stations, time.time()
-                if view.district == d:              # user may have switched meanwhile
-                    view.airly, view.airly_status = air
+                if view.district == d:              # the map may have moved on meanwhile
+                    view.community_all = allc
+                    view.airly, view.airly_status, view.airly_for = air[0], air[1], d
                     view.community, view.community_status = com
+                elif not demo:
+                    view.community_all = allc
+                    sync_community()
                 record_history(view)
                 load_tile_surfaces(view)
                 area.queue_draw()
+                preload_streets()
             GLib.idle_add(apply)
-            if not demo:    # sensors that appeared since the district was opened
-                preload_streets(com[0], d)
 
         threading.Thread(target=work, daemon=True).start()
         return True     # keep the GLib timer running
 
     def on_motion(_w, ev):
+        if drag["on"]:                  # the map is being dragged
+            if not ev.state & Gdk.ModifierType.BUTTON1_MASK:
+                end_drag()              # the release happened where we could not see it
+            else:
+                dx, dy = ev.x - drag["x"], ev.y - drag["y"]
+                if view.dragging or abs(dx) + abs(dy) > 3:      # ignore a shaky click
+                    view.dragging = True
+                    drag["x"], drag["y"] = ev.x, ev.y
+                    set_view(*pan_by(view.center, view.zoom, dx, dy), view.zoom)
+                return
         hit = min(view.hits, key=lambda h: (h[0] - ev.x) ** 2 + (h[1] - ev.y) ** 2, default=None)
         hid = hit[2].uid if hit and (hit[0] - ev.x) ** 2 + (hit[1] - ev.y) ** 2 <= 14 ** 2 else None
         chip = in_chip(ev)
@@ -1591,39 +1813,119 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         rect.x, rect.y, rect.width, rect.height = (int(v) for v in rect_xywh)
         menu.popup_at_rect(area.get_window(), rect, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, ev)
 
-    def set_district(name):
-        if name == view.district:
+    def set_view(lat, lon, zoom, delay=350):
+        """Move the map. It is redrawn at once from what is already in memory;
+        anything that needs the network waits until the map has been still for
+        `delay` ms, so dragging across the city does not fire a request per pixel."""
+        lat, lon, zoom = clamp_view(lat, lon, zoom)
+        if (lat, lon) == tuple(view.center) and zoom == view.zoom:
             return
-        view.district, view.hover, view.gap_hover = name, None, None
-        view.airly, view.airly_status = [], ("Airly: loading…" if name and airly else "")
-        view.community, view.community_status = [], ("Community: loading…" if name else "")
-        view.street_status = ""
-        save_state()
-        load_tile_surfaces(view)        # whatever is cached shows immediately
+        view.center, view.zoom = (lat, lon), zoom
+        view.gen += 1                   # background work for the previous view stops
+        name, view.outside = locate(lat, lon, zoom)
+        view.hover = view.gap_hover = None
+        if name != view.district:       # the middle of the map crossed into another district
+            view.district = name
+            view.airly, view.airly_for = [], None
+            view.airly_status = "Airly: loading…" if name else ""
+            view.street_status = ""
+            if demo:
+                view.community_all = demo_community(name) if name else []
+            sync_community()
+        load_tile_surfaces(view)        # tiles already on disk show at once
         area.queue_draw()
+        if pending["id"]:
+            GLib.source_remove(pending["id"])
+        pending["id"] = GLib.timeout_add(delay, settle)
 
-        def work():                     # fetch the rest off the UI thread
+    def settle():
+        """The map has stopped moving: fetch what the new view needs."""
+        pending["id"] = 0
+        gen, d, (lat, lon), zoom = view.gen, view.district, view.center, view.zoom
+        save_state()
+
+        def work():
             _, _, mw, mh = map_rect()
-            ensure_tiles(mw, mh, name)
+            ensure_tiles(mw, mh, lat, lon, zoom)
             GLib.idle_add(lambda: (load_tile_surfaces(view), area.queue_draw()) and False)
-            com = community_view(community, name, demo, geocoder)
-
-            def apply_com():                # one request, arrives first
-                if view.district == name:
-                    view.community, view.community_status = com
-                    area.queue_draw()
-            GLib.idle_add(apply_com)
-            if not demo:                    # all streets, straight away, alongside Airly
-                preload_streets(com[0], name)
-            air = airly_view(airly, name, demo)
+            if view.gen != gen:
+                return                  # moved again while the tiles were downloading
+            allc = all_community_sensors(community, d, demo, geocoder) if zoom >= DISTRICT_ZOOM else []
 
             def apply():
-                if view.district == name:
-                    view.airly, view.airly_status = air
+                if view.gen != gen:
+                    return              # moved again: the next settle takes over
+                view.community_all = allc
+                sync_community()
+                if d and view.airly_for != d:
+                    # Airly costs one request per sensor, so wait until the map
+                    # has really come to rest on this district before asking.
+                    GLib.timeout_add(AIRLY_SETTLE_MS, fetch_airly, gen, d)
+                else:
+                    record_history(view)
+                area.queue_draw()
+                preload_streets()
+            GLib.idle_add(apply)
+        threading.Thread(target=work, daemon=True).start()
+        return False                    # one-shot timer
+
+    def fetch_airly(gen, d):
+        if view.gen != gen or view.district != d:
+            return False                # the map moved on: do not spend the requests
+
+        def work():
+            air = airly_view(airly, d, demo)
+
+            def apply():
+                if view.district == d:
+                    view.airly, view.airly_status, view.airly_for = air[0], air[1], d
                     record_history(view)        # all sources for this district are in now
                     area.queue_draw()
             GLib.idle_add(apply)
         threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def set_district(name):
+        """Jump to a district's standard view ("" = the whole city)."""
+        set_view(*viewport(name), delay=0)
+
+    def zoom_at(x, y, step):
+        """Zoom one level in or out, keeping the point under the pointer in place."""
+        zoom = min(max(view.zoom + step, ZOOM_MIN), ZOOM_MAX)
+        if zoom == view.zoom:
+            return
+        if zoom < DISTRICT_ZOOM:        # all the way out: the standard whole-city view
+            return set_view(*viewport(""))
+        mx, my, mw, mh = map_rect()
+        set_view(*zoom_about(view.center, view.zoom, zoom, x - (mx + mw / 2), y - (my + mh / 2)), zoom)
+
+    def on_scroll(_w, ev):
+        if not inside(map_rect(), ev):
+            return False
+        if ev.direction == Gdk.ScrollDirection.UP:
+            step = 1
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            step = -1
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:     # touchpads, and wheels on some setups
+            scroll["acc"] += ev.delta_y
+            if abs(scroll["acc"]) < 1:
+                return True
+            step = -1 if scroll["acc"] > 0 else 1
+            scroll["acc"] = 0.0
+        else:
+            return False
+        zoom_at(ev.x, ev.y, step)
+        return True
+
+    def end_drag():
+        drag["on"] = False
+        if view.dragging:
+            view.dragging = False
+            area.queue_draw()           # the labels come back
+
+    def on_release(_w, ev):
+        if ev.button == 1 and drag["on"]:
+            end_drag()
 
     def toggle_csv(*_):
         view.log.enabled = not view.log.enabled
@@ -1651,7 +1953,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         for name in ["", *sorted(DISTRICTS, key=PL_SORT_KEY)]:
             item = Gtk.CheckMenuItem(label=name or "Whole city")
             item.set_draw_as_radio(True)
-            item.set_active(name == view.district)      # before connect: no spurious signal
+            item.set_active(name == view.district and not view.outside)     # before connect: no spurious signal
             item.connect("activate", lambda _i, n=name: set_district(n))
             sub.append(item)
             if not name:
@@ -1674,7 +1976,9 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
             rect.x, rect.y, rect.width, rect.height = (int(v) for v in view.chip)
             menu.popup_at_rect(area.get_window(), rect,
                                Gdk.Gravity.SOUTH_EAST, Gdk.Gravity.NORTH_EAST, ev)
-        elif ev.button == 1:
+        elif ev.button == 1 and inside(map_rect(), ev):
+            drag.update(on=True, x=ev.x, y=ev.y)        # dragging the map moves the map
+        elif ev.button == 1:                            # dragging anywhere else moves the widget
             win.begin_move_drag(ev.button, int(ev.x_root), int(ev.y_root), ev.time)
         elif ev.button == 3:
             menu = Gtk.Menu()
@@ -1713,6 +2017,7 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
         try:
             STATE_FILE.write_text(json.dumps(
                 {"pos": list(win.get_position()), "district": view.district, "labels": view.labels,
+                 "center": list(view.center), "zoom": view.zoom,
                  "refresh_minutes": view.refresh_minutes,
                  "csv": view.log.enabled if view.log else saved.get("csv", True)}, ensure_ascii=False))
         except OSError:
@@ -1726,6 +2031,8 @@ def run_gtk(demo: bool, district: str | None = None) -> None:
     area.connect("motion-notify-event", on_motion)
     area.connect("leave-notify-event", on_leave)
     area.connect("button-press-event", on_press)
+    area.connect("button-release-event", on_release)
+    area.connect("scroll-event", on_scroll)
     win.connect("delete-event", quit_app)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, quit_app)   # SIGTERM at logout
 
@@ -1746,7 +2053,7 @@ def snapshot(path: str, demo: bool, district: str | None = None, labels: bool = 
     import cairo
     view = View(demo=demo, loading=False, district=district or "")
     _, _, mw, mh = map_rect()
-    ensure_tiles(mw, mh, view.district)
+    ensure_tiles(mw, mh, *view.center, view.zoom)
     if demo:
         view.stations = demo_stations()
     else:
@@ -1758,6 +2065,7 @@ def snapshot(path: str, demo: bool, district: str | None = None, labels: bool = 
     geocoder = Geocoder()
     view.labels = labels
     view.community, view.community_status = community_view(Community(), view.district, demo, geocoder)
+    view.community_all, view.airly_for = view.community, view.district
     if not demo:
         geocoder.resolve(view.community)
     record_history(view)
@@ -1767,6 +2075,142 @@ def snapshot(path: str, demo: bool, district: str | None = None, labels: bool = 
     ctx.scale(2, 2)
     render(ctx, view)
     surf.write_to_png(path)
+
+
+# ----------------------------------------------------------------------------
+# 6. district outlines (data)
+# ----------------------------------------------------------------------------
+# Used to tell which district the middle of the map is in, and whether it is
+# outside Warsaw. Source: https://github.com/andilabs/warszawa-dzielnice-geojson
+# (warszawa-dzielnice.geojson), simplified here to about 40 m. Each point is
+# "(lon - 20) * 10000,(lat - 52) * 10000".
+DISTRICT_SHAPES = {
+    "Bemowo":
+        "8731,2167 8728,2152 8719,2153 8710,2104 8702,2104 8709,2089 8768,2094 8805,2090 8877,2108 "
+        "9141,2141 9157,2173 9213,2183 9243,2206 9245,2223 9216,2278 9214,2297 9249,2412 9262,2434 "
+        "9449,2536 9476,2565 9472,2571 9518,2614 9536,2619 9431,2647 9415,2663 9390,2671 9197,2710 "
+        "8937,2772 8891,2806 8880,2802 8860,2806 8843,2791 8812,2797 8787,2652 8637,2500 8727,2493 "
+        "8839,2473 8846,2482 8850,2473 8908,2471 8914,2450 8938,2439 8930,2399 8895,2320 8797,2320 "
+        "8728,2288 8725,2257 8753,2248 8746,2167",
+    "Białołęka":
+        "9962,2873 9978,2880 9971,2894 9988,2903 9989,2930 10006,2933 10029,2913 10097,2930 10127,2943 "
+        "10130,2975 10146,2979 10180,2959 10234,2978 10229,2985 10238,2988 10244,2982 10410,3020 "
+        "10606,3070 10614,3083 10621,3084 10623,3074 10686,3079 10836,3078 10778,3220 10895,3238 "
+        "10860,3320 10878,3323 10875,3329 10867,3327 10855,3347 10850,3373 10826,3372 10811,3431 "
+        "10857,3434 10815,3540 10787,3536 10738,3673 10615,3657 10606,3626 10541,3631 10493,3618 "
+        "10487,3637 10443,3640 10408,3630 10307,3617 10275,3651 10254,3634 10234,3574 10215,3567 "
+        "10136,3560 10133,3568 10088,3571 10083,3601 10057,3641 9947,3618 9919,3628 9781,3590 9713,3590 "
+        "9661,3682 9542,3679 9523,3665 9449,3667 9452,3662 9440,3660 9436,3664 9393,3618 9351,3632 "
+        "9392,3584 9385,3581 9340,3598 9309,3579 9275,3595 9241,3596 9230,3570 9124,3530 9233,3436 "
+        "9258,3361 9250,3280 9257,3248 9278,3214 9310,3182 9373,3147 9475,3107 9513,3078 9561,3026 "
+        "9626,2984 9705,2958 9854,2926 9912,2905",
+    "Bielany":
+        "8771,2941 8758,2805 8840,2791 8860,2806 8880,2802 8891,2806 8937,2772 9197,2710 9390,2671 "
+        "9415,2663 9431,2647 9536,2619 9557,2635 9587,2683 9631,2715 9650,2741 9670,2741 9701,2754 "
+        "9852,2834 9855,2857 9866,2864 9905,2848 9962,2873 9912,2905 9854,2926 9705,2958 9626,2984 "
+        "9561,3026 9513,3078 9475,3107 9373,3147 9310,3182 9266,3231 9251,3294 9226,3268 9221,3237 "
+        "9131,3218 9105,3241 9078,3222 9071,3221 9066,3234 8952,3214 8915,3176 8898,3136 8869,3132 "
+        "8798,3138 8763,3149 8762,3140 8793,3117 8809,3092 8762,2987",
+    "Mokotów":
+        "10309,2069 10286,2072 10259,2093 10245,2114 10207,2133 9984,2091 9879,2103 9820,1929 9846,1918 "
+        "9865,1892 9868,1711 9877,1706 9883,1715 10080,1671 10086,1679 10114,1669 10120,1655 10157,1655 "
+        "10158,1648 10182,1642 10195,1668 10243,1665 10257,1677 10306,1668 10374,1688 10422,1724 "
+        "10433,1749 10452,1745 10538,1694 10600,1702 10679,1697 10685,1702 10641,1741 10660,1748 "
+        "10653,1756 10688,1764 10815,1845 10894,1812 10898,1806 10950,1809 10945,1823 10955,1854 "
+        "10979,1861 10996,1873 10999,1910 11054,1941 11041,2041 11008,2097 10928,2154 10827,2182 "
+        "10635,2189 10612,2166 10540,2154 10543,2147 10494,2140 10491,2147 10464,2143 10474,2114 "
+        "10447,2097 10363,2096 10349,2069",
+    "Ochota":
+        "10015,2281 9757,2220 9690,2195 9683,2200 9592,2181 9546,2146 9443,2144 9383,2122 9343,2119 "
+        "9327,2111 9372,2091 9461,2014 9820,1929 9879,2103 9984,2091 10070,2107 10050,2172 10047,2231",
+    "Praga-Południe":
+        "10929,2153 11195,2324 11247,2325 11274,2333 11324,2391 11302,2408 11323,2434 11218,2524 "
+        "11189,2535 11143,2568 11146,2595 10883,2605 10766,2594 10660,2577 10622,2556 10452,2493 "
+        "10436,2476 10436,2430 10409,2406 10369,2386 10494,2254 10558,2212 10635,2189 10827,2182",
+    "Praga-Północ":
+        "10131,2948 10116,2936 10029,2913 10006,2933 9989,2930 9988,2903 9971,2894 9978,2880 9962,2873 "
+        "10003,2836 10031,2794 10054,2683 10094,2612 10210,2489 10369,2386 10409,2406 10436,2430 "
+        "10436,2476 10457,2497 10622,2556 10652,2575 10742,2590 10383,2680 10319,2708 10266,2721 "
+        "10211,2798 10207,2861 10150,2911",
+    "Rembertów":
+        "11324,2391 11382,2432 11394,2432 11418,2391 11617,2430 11636,2416 11734,2435 11769,2452 "
+        "11840,2463 11846,2469 11830,2495 11869,2504 11870,2518 11888,2523 11902,2497 11912,2500 "
+        "11905,2562 11793,2567 11824,2579 11842,2598 11849,2661 11839,2678 11758,2724 11706,2769 "
+        "11724,2886 11693,2909 11661,2903 11635,2921 11629,2915 11639,2894 11613,2854 11559,2836 "
+        "11491,2793 11078,2744 11095,2708 11086,2705 11089,2685 11076,2683 11105,2597 11146,2595 "
+        "11143,2568 11189,2535 11218,2524 11323,2434 11302,2408",
+    "Śródmieście":
+        "10369,2386 10210,2489 10094,2612 10035,2594 10001,2591 9866,2598 9810,2594 9826,2546 9954,2397 "
+        "9982,2332 10047,2231 10050,2172 10070,2107 10207,2133 10245,2114 10259,2093 10286,2072 "
+        "10349,2069 10363,2096 10447,2097 10474,2114 10464,2143 10491,2147 10494,2140 10543,2147 "
+        "10540,2154 10613,2166 10635,2189 10558,2212 10508,2242",
+    "Targówek":
+        "10369,2686 10556,2633 10740,2590 10883,2605 11105,2597 11076,2683 11089,2685 11086,2705 "
+        "11095,2708 11078,2744 11049,2741 10987,2865 10956,2863 10950,2882 10875,2955 10835,3029 "
+        "10855,3032 10836,3078 10686,3079 10623,3074 10621,3084 10614,3083 10606,3070 10410,3020 "
+        "10244,2982 10238,2988 10229,2985 10234,2978 10180,2959 10146,2979 10130,2975 10126,2957 "
+        "10146,2917 10207,2861 10208,2806 10247,2738 10271,2718 10319,2708",
+    "Ursus":
+        "8519,1997 8538,1953 8567,1913 8560,1877 8671,1908 8672,1825 8977,1825 8993,1841 9090,1845 "
+        "9092,1859 9148,1858 9192,1938 9154,1927 9121,1943 9105,1960 9007,1995 9001,2017 8812,2089 "
+        "8784,2093 8658,2083 8568,2067 8526,2037",
+    "Ursynów":
+        "9796,1295 9796,1276 9825,1239 9890,1237 9849,1204 9873,1157 9837,1117 9867,1106 9845,1056 "
+        "9874,1051 9869,1039 9916,1031 10184,1037 10186,1060 10355,1062 10352,1067 10437,1130 10508,1090 "
+        "10580,1072 10800,979 10826,987 10866,1028 10893,1039 10919,1046 10960,1046 11035,1058 11018,1078 "
+        "10982,1088 10948,1139 10882,1144 10881,1148 10940,1147 10916,1176 10895,1174 10886,1182 "
+        "10915,1185 10925,1204 10912,1206 10837,1286 10793,1359 10771,1352 10754,1354 10738,1373 "
+        "10723,1372 10715,1400 10677,1444 10696,1452 10613,1524 10617,1532 10607,1555 10551,1612 "
+        "10467,1681 10538,1694 10452,1745 10433,1749 10422,1724 10374,1688 10306,1668 10257,1677 "
+        "10243,1665 10195,1668 10182,1642 10158,1648 10157,1655 10120,1655 10114,1669 10086,1679 "
+        "10080,1671 9883,1715 9877,1706 9868,1711 9892,1419 9839,1420 9830,1404 9847,1392 9792,1339",
+    "Wawer":
+        "11054,1941 11102,1868 11147,1825 11212,1786 11315,1745 11379,1703 11417,1654 11440,1584 "
+        "11471,1550 11502,1531 11597,1494 11650,1447 11714,1454 11759,1467 11759,1485 11884,1505 "
+        "11886,1493 12151,1518 12347,1589 12488,1530 12471,1516 12557,1472 12623,1527 12626,1531 "
+        "12540,1574 12566,1607 12604,1620 12615,1657 12631,1674 12677,1674 12676,1684 12708,1685 "
+        "12703,1696 12675,1701 12673,1733 12696,1734 12700,1720 12712,1722 12702,1738 12598,1826 "
+        "12634,1840 12654,1860 12402,1959 12388,1970 12163,1974 12157,2007 12164,2011 12155,2021 "
+        "12166,2047 12184,2053 12146,2093 12153,2122 12132,2144 12122,2143 12065,2205 12073,2206 "
+        "12073,2276 12119,2300 12071,2332 12009,2347 11970,2346 11840,2398 11765,2451 11734,2435 "
+        "11636,2416 11617,2430 11418,2391 11394,2432 11382,2432 11324,2391 11274,2333 11247,2325 "
+        "11195,2324 10929,2153 10992,2112 11025,2074 11047,2015",
+    "Wesoła":
+        "12617,2101 12505,2226 12495,2226 12504,2319 12544,2353 12548,2387 12488,2366 12454,2361 "
+        "12395,2363 12379,2450 12537,2458 12546,2532 12524,2533 12505,2627 11905,2562 11912,2500 "
+        "11902,2497 11888,2523 11870,2518 11869,2504 11830,2495 11846,2469 11840,2463 11765,2451 "
+        "11840,2398 11970,2346 12009,2347 12071,2332 12119,2300 12073,2276 12073,2206 12065,2205 "
+        "12122,2143 12132,2144 12153,2122 12146,2093 12184,2053 12166,2047 12155,2021 12164,2011 "
+        "12157,2007 12163,1974 12388,1970 12402,1959 12430,1984 12430,1993 12457,2009 12509,2025 "
+        "12486,2042 12482,2060 12491,2070 12541,2094",
+    "Wilanów":
+        "11332,1230 11347,1235 11358,1277 11387,1313 11405,1320 11401,1329 11452,1356 11478,1385 "
+        "11502,1398 11537,1401 11532,1427 11547,1436 11650,1447 11597,1494 11502,1531 11471,1550 "
+        "11440,1584 11417,1654 11379,1703 11315,1745 11212,1786 11147,1825 11102,1868 11054,1941 "
+        "10999,1910 10996,1873 10979,1861 10955,1854 10945,1823 10950,1809 10898,1806 10894,1812 "
+        "10815,1845 10688,1764 10653,1756 10660,1748 10641,1741 10685,1702 10679,1697 10600,1702 "
+        "10467,1681 10551,1612 10607,1555 10617,1532 10613,1524 10696,1452 10677,1444 10715,1400 "
+        "10723,1372 10738,1373 10754,1354 10771,1352 10793,1359 10837,1286 10912,1206 10925,1204 "
+        "10915,1185 10886,1182 10895,1174 10916,1176 10940,1147 10881,1148 10882,1144 10948,1139 "
+        "10964,1106 10984,1086 11009,1081 11001,1084 11101,1132 11089,1145 11160,1186 11192,1188 "
+        "11229,1204 11264,1241 11271,1261 11295,1272",
+    "Włochy":
+        "9830,1404 9839,1420 9892,1419 9869,1626 9865,1892 9841,1922 9461,2014 9372,2091 9325,2114 "
+        "9268,2095 9233,2105 9226,2121 9244,2134 9238,2137 9216,2135 9183,2146 9147,2146 9141,2141 "
+        "8877,2108 8811,2094 8805,2090 9001,2017 9007,1995 9105,1960 9121,1943 9154,1927 9192,1938 "
+        "9112,1796 9170,1785 9168,1778 9187,1774 9192,1711 9209,1710 9232,1689 9247,1684 9254,1672 "
+        "9239,1662 9305,1640 9300,1633 9377,1601 9470,1572 9538,1561 9538,1530 9584,1499 9697,1454 "
+        "9776,1435",
+    "Wola":
+        "10015,2281 9982,2332 9954,2397 9826,2546 9810,2594 9656,2543 9600,2558 9547,2553 9516,2555 "
+        "9480,2568 9427,2522 9262,2434 9249,2412 9214,2297 9216,2278 9245,2223 9243,2206 9213,2183 "
+        "9157,2173 9147,2146 9183,2146 9216,2135 9238,2137 9244,2134 9229,2126 9229,2109 9256,2095 "
+        "9268,2095 9343,2119 9383,2122 9443,2144 9546,2146 9592,2181 9683,2200 9690,2195 9757,2220",
+    "Żoliborz":
+        "9810,2594 9866,2598 10001,2591 10035,2594 10094,2612 10054,2683 10031,2794 10003,2836 9962,2873 "
+        "9905,2848 9866,2864 9855,2857 9852,2834 9701,2754 9670,2741 9650,2741 9631,2715 9578,2674 "
+        "9557,2635 9532,2615 9518,2614 9472,2571 9476,2565 9516,2555 9547,2553 9600,2558 9656,2543",
+}
 
 
 def main() -> None:

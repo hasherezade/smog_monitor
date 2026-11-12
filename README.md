@@ -28,13 +28,18 @@ Other ways to start it:
 
 ## Using it
 
-- **Move:** drag the widget with the left mouse button.
-- **District:** the button at the top right opens the list of districts;
-  "Whole city" takes you back. In a district view the Airly and community
-  sensors appear as well.
+- **Move the widget:** drag it by the header or by the area below the map.
+- **Move the map:** drag the map itself. Scroll over it to zoom in and out;
+  zooming all the way out returns to the whole city. The map stays within the
+  Warsaw area, and the view is remembered.
+- **District:** the widget describes the district in the middle of the map, and
+  the name changes as you move. Beyond the city boundary it says "Outside the
+  monitored area". The button at the top right jumps straight to a district, or
+  back to "Whole city". Zoomed in, the Airly and community sensors appear too.
 - **Details:** hover a marker to see its name, category and readings. With
-  nothing hovered, a district view shows the average of all sensors in view
-  and the time of the latest measurement.
+  nothing hovered, you see the district's average and the time of the latest
+  measurement. The average always covers the same area round the district,
+  however far you have zoomed in or moved the map.
 - **Colour scale:** the white dot marks the hovered sensor, or the average.
 - **History:** under the scale you see the lowest, average and highest PM10
   and PM2.5 so far, with a small trend line, for the hovered sensor or else the
@@ -149,8 +154,11 @@ history in `~/.local/share/warsaw-smog/data/`.
 
 - Under Wayland (the Ubuntu default) the widget cannot pin itself to the
   desktop or remember its position; under X11 it can.
-- District views are centred by hand and show a rectangle round the district,
-  so sensors just across the boundary are included.
+- A district's average is taken over a rectangle round the district, so
+  sensors just across its boundary are included.
+- Airly sensors are shown only for the district in the middle of the map, and
+  are fetched once the map has rested there for two seconds, to stay within
+  Airly's daily request limit.
 
 ## Attribution
 
@@ -159,6 +167,7 @@ history in `~/.local/share/warsaw-smog/data/`.
 - Community sensor data: Sensor.Community, https://sensor.community
 - Optional sensor data: Airly, https://airly.org/map/en/
 - Map: © OpenStreetMap contributors
+- District outlines: https://github.com/andilabs/warszawa-dzielnice-geojson
 
 ## Credits
 
